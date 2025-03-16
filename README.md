@@ -1,9 +1,9 @@
-# CS 2620: Wire Protocols Design Exercise
+# CS 2620: Replication Design Exercise
 
 > [!NOTE]
 > **Authors:** Daniel Li, Rajiv Swamy
 >
-> **Date:** 2/12/25
+> **Date:** 3/26/25
 
 ## Usage Instructions
 
@@ -43,6 +43,7 @@ python -m grpc_tools.protoc \
 ```
 
 This will generate files:
+
 - `chat_pb2.py`: classes for the message types defined in the proto file
 - `chat_pb2.pyi`: type hints for IDEs
 - `chat_pb2_grpc.py`: the servicer and stub classes
