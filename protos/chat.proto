@@ -1,0 +1,150 @@
+/**
+ *  Usage:
+ *      python -m grpc_tools.protoc -I=protos \
+ *      --python_out=. \
+ *      --pyi_out=. \
+ *      --grpc_python_out=. \
+ *      protos/chat.proto
+ */
+
+syntax = "proto3";
+
+package chat;
+
+/* Chat server interface */
+service Chat {
+    rpc Echo(EchoRequest) returns (EchoResponse) {}
+
+    rpc Authenticate(AuthRequest) returns (AuthResponse) {}
+
+    rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse) {}
+
+    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse) {}
+
+    rpc SendMessage(SendMessageRequest) returns (SendMessageResponse) {}
+
+    rpc ReadMessages(ReadMessagesRequest) returns (ReadMessagesResponse) {}
+
+    rpc DeleteMessages(DeleteMessagesRequest) returns (DeleteMessagesResponse) {}
+
+    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse) {}
+}
+
+/* Echo */
+message EchoRequest {
+    Status status = 1;
+    string message = 2;
+}
+
+message EchoResponse {
+    Status status = 1;
+    string message = 2;
+}
+
+
+/* Authenticate */
+message AuthRequest {
+    enum ActionType {
+        CREATE_ACCOUNT = 0;
+        LOGIN = 1;
+    }
+
+    ActionType action_type = 1;
+    string username = 2;
+    string password = 3;
+}
+
+message AuthResponse {
+    Status status = 1;
+    string error_message = 2;
+}
+
+
+/* Get messages */
+message GetMessagesRequest {
+    string username = 1;
+}
+
+message GetMessagesResponse {
+    Status status = 1;
+    string error_message = 2;
+    repeated Message messages = 3;
+}
+
+
+/* List users */
+message ListUsersRequest {
+    string username = 1;
+    string pattern = 2;
+}
+
+message ListUsersResponse {
+    Status status = 1;
+    string error_message = 2;
+    repeated string usernames = 3;
+}
+
+
+/* Send message */
+message SendMessageRequest {
+    string username = 1;
+    Message message = 2;
+}
+
+message SendMessageResponse {
+    Status status = 1;
+    string error_message = 2;
+}
+
+
+/* Read messages */
+message ReadMessagesRequest {
+    string username = 1;
+    repeated bytes message_ids = 2;
+}
+
+message ReadMessagesResponse {
+    Status status = 1;
+    string error_message = 2;
+}
+
+
+/* Delete messages */
+message DeleteMessagesRequest {
+    string username = 1;
+    repeated bytes message_ids = 2;
+}
+
+message DeleteMessagesResponse {
+    Status status = 1;
+    string error_message = 2;
+}
+
+
+/* Delete user */
+message DeleteUserRequest {
+    string username = 1;
+}
+
+message DeleteUserResponse {
+    Status status = 1;
+    string error_message = 2;
+}
+
+
+/* Response status */
+enum Status {
+    SUCCESS = 0;
+    ERROR = 1;
+}
+
+
+/* Message */
+message Message {
+    bytes id = 1;
+    string sender = 2;
+    string recipient = 3;
+    string body = 4;
+    double timestamp = 5;
+    bool read = 6;
+}

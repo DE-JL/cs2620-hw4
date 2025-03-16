@@ -1,0 +1,8 @@
+network:
+    public_status: false
+    interface: en0
+    localhost: localhost
+    server_port: 8000
+protocol_type: custom
+gui_refresh_rate: 0.5
+debug: true
