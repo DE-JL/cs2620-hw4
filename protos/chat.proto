@@ -1,150 +1,66 @@
-/**
- *  Usage:
- *      python -m grpc_tools.protoc -I=protos \
- *      --python_out=. \
- *      --pyi_out=. \
- *      --grpc_python_out=. \
- *      protos/chat.proto
- */
-
 syntax = "proto3";
 
 package chat;
 
-/* Chat server interface */
 service Chat {
-    rpc Echo(EchoRequest) returns (EchoResponse) {}
+    // Called by the new leader to announce itself as coordinator
+    rpc Coordinator(CoordinatorRequest) returns (Ack);
 
-    rpc Authenticate(AuthRequest) returns (AuthResponse) {}
+    // Called when a server starts an election
+    rpc Election(ElectionRequest) returns (Ack);
 
-    rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse) {}
+    // Executes a query
+    rpc Execute(ExecuteRequest) returns (ExecuteRequest);
 
-    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse) {}
+    // Gets all commits after a specified commit ID
+    rpc GetCommits(GetCommitsRequest) returns (GetCommitsResponse);
 
-    rpc SendMessage(SendMessageRequest) returns (SendMessageResponse) {}
+    // Gets the ID of the server that this server thinks is the leader
+    rpc GetLeader(GetLeaderRequest) returns (GetLeaderResponse);
 
-    rpc ReadMessages(ReadMessagesRequest) returns (ReadMessagesResponse) {}
-
-    rpc DeleteMessages(DeleteMessagesRequest) returns (DeleteMessagesResponse) {}
-
-    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse) {}
+    // Called periodically to check if a server is alive
+    rpc Heartbeat(HeartbeatRequest) returns (Ack);
 }
 
-/* Echo */
-message EchoRequest {
-    Status status = 1;
-    string message = 2;
+message Ack {}
+
+message Commit {
+    int32 id = 1;       // ID of the commit
+    string query = 2;   // The query (JSON-string)
 }
 
-message EchoResponse {
-    Status status = 1;
-    string message = 2;
+message CoordinatorRequest {
+    int32 leader_id = 1;                    // ID of the new leader
+    repeated Commit commit_history = 2;     // The commit history of the new leader
 }
 
-
-/* Authenticate */
-message AuthRequest {
-    enum ActionType {
-        CREATE_ACCOUNT = 0;
-        LOGIN = 1;
-    }
-
-    ActionType action_type = 1;
-    string username = 2;
-    string password = 3;
+message ElectionRequest {
+    int32 candidate_id = 1;     // ID of the server that wants to be leader
 }
 
-message AuthResponse {
-    Status status = 1;
-    string error_message = 2;
+message ExecuteRequest {
+    int32 leader_id = 1;    // ID of the leader forwarding the request
+    string query = 2;       // The JSON-string of the query
 }
 
-
-/* Get messages */
-message GetMessagesRequest {
-    string username = 1;
+message GetCommitsRequest {
+    int32 server_id = 1;            // ID of the requester
+    int32 latest_commit_id = 2;     // Fetch all commits occurring after this one
 }
 
-message GetMessagesResponse {
-    Status status = 1;
-    string error_message = 2;
-    repeated Message messages = 3;
+message GetCommitsResponse {
+    repeated Commit commits = 2;    // The commits requested
 }
 
-
-/* List users */
-message ListUsersRequest {
-    string username = 1;
-    string pattern = 2;
+message GetLeaderRequest {
+    int32 server_id = 1;    // ID of the server to query
 }
 
-message ListUsersResponse {
-    Status status = 1;
-    string error_message = 2;
-    repeated string usernames = 3;
+message GetLeaderResponse {
+    int32 leader_id = 1;    // ID of who the server thinks is the leader
 }
 
-
-/* Send message */
-message SendMessageRequest {
-    string username = 1;
-    Message message = 2;
+message HeartbeatRequest {
+    int32 server_id = 1;    // ID of the server sending the heartbeat
 }
 
-message SendMessageResponse {
-    Status status = 1;
-    string error_message = 2;
-}
-
-
-/* Read messages */
-message ReadMessagesRequest {
-    string username = 1;
-    repeated bytes message_ids = 2;
-}
-
-message ReadMessagesResponse {
-    Status status = 1;
-    string error_message = 2;
-}
-
-
-/* Delete messages */
-message DeleteMessagesRequest {
-    string username = 1;
-    repeated bytes message_ids = 2;
-}
-
-message DeleteMessagesResponse {
-    Status status = 1;
-    string error_message = 2;
-}
-
-
-/* Delete user */
-message DeleteUserRequest {
-    string username = 1;
-}
-
-message DeleteUserResponse {
-    Status status = 1;
-    string error_message = 2;
-}
-
-
-/* Response status */
-enum Status {
-    SUCCESS = 0;
-    ERROR = 1;
-}
-
-
-/* Message */
-message Message {
-    bytes id = 1;
-    string sender = 2;
-    string recipient = 3;
-    string body = 4;
-    double timestamp = 5;
-    bool read = 6;
-}

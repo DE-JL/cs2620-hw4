@@ -1,323 +1,404 @@
-import uuid
+import argparse
+import sqlite3
+import threading
+import time
 
 from concurrent import futures
-from fnmatch import fnmatch
 
 from protos.chat_pb2 import *
 from protos.chat_pb2_grpc import *
-from config import DEBUG, LOCALHOST, PUBLIC_STATUS, SERVER_PORT
-from entity import User
-from utils import get_ipaddr
+from utils import get_ip_to_addr_map
 
 
 class ChatServer(ChatServicer):
-    """Main server class that manages users and message state for all clients."""
+    """Server implementation for the bully election algorithm."""
 
-    def __init__(self):
-        # Initialize storage for users and messages
-        self.users: dict[str, User] = {}
-        self.messages: dict[uuid.UUID, Message] = {}
-        self.inbound_volume: int = 0
-        self.outbound_volume: int = 0
+    HEARTBEAT_INTERVAL = 2
+    ELECTION_TIMEOUT = 2
 
-    def Echo(self, request: EchoRequest, context: grpc.ServicerContext) -> EchoResponse:
-        return EchoResponse(status=Status.SUCCESS,
-                            message=request.message)
-
-    def Authenticate(self, request: AuthRequest, context: grpc.ServicerContext) -> AuthResponse:
+    def __init__(self, server_id: int):
         """
-        This function handles all authentication requests: users creating an account or logging in.
+        Represents a server instance in a distributed system that manages communication,
+        concurrency, and leader election processes. It provides initialization to set
+        up server attributes, lock mechanism for thread safety, and starts a background
+        thread for sending heartbeat signals.
 
-        The function returns three possible errors to the client:
-        1. Attempting to create an account with a username that already exists.
-        2. Attempting to log into an account that doesn't exist.
-        3. Attempting to log into an account with the wrong password.
-
-        If there was an error, the server sends an ErrorResponse() object with a description to the client.
-        On success, the server sends a blank AuthResponse() object to the client.
-
-        :param request: The AuthRequest object.
-        :param context: The servicer context.
-        :rtype: AuthResponse
+        :param server_id: Unique identifier for the server.
         """
-        self.inbound_volume += len(request.SerializeToString())
+        self.server_id = server_id
+        self.id_to_addr = get_ip_to_addr_map()
 
-        username, password = request.username, request.password
-        match request.action_type:
-            case AuthRequest.ActionType.CREATE_ACCOUNT:
-                if username in self.users:
-                    resp = AuthResponse(status=Status.ERROR,
-                                        error_message=f"Create account failed: user \"{username}\" already exists.")
-                else:
-                    self.users[username] = User(username=username, password=password)
-                    resp = AuthResponse(status=Status.SUCCESS)
-            case AuthRequest.ActionType.LOGIN:
-                if username not in self.users:
-                    resp = AuthResponse(status=Status.ERROR,
-                                        error_message=f"Login failed: user \"{username}\" does not exist.")
-                elif password != self.users[username].password:
-                    resp = AuthResponse(status=Status.ERROR,
-                                        error_message=f"Login failed: incorrect password.")
-                else:
-                    resp = AuthResponse(status=Status.SUCCESS)
-            case _:
-                print("Unknown AuthRequest action type.")
-                exit(1)
+        # Initialize the database
+        self.db_file = f"server{self.server_id}.db"
+        self.init_db()
 
-        self.outbound_volume += len(resp.SerializeToString())
+        # Initially, we don’t know the leader yet
+        self.leader_id = None
 
-        if DEBUG:
-            self.log()
+        # For concurrency control
+        self.lock = threading.Lock()
 
-        return resp
+        # Start background heartbeat thread
+        self.shutdown = threading.Event()
+        self.election_in_progress = False
 
-    def GetMessages(self, request: GetMessagesRequest, context: grpc.ServicerContext) -> GetMessagesResponse:
+        # Start the heartbeat monitor
+        self.heartbeat_thread = threading.Thread(target=self.send_heartbeats,
+                                                 daemon=True)
+        self.heartbeat_thread.start()
+
+    def Coordinator(self,
+                    request: CoordinatorRequest,
+                    context: grpc.ServicerContext) -> Ack:
         """
-        This function handles all get messages requests.
+        Processes a request to acknowledge a new leader.
 
-        It responds with a list of non-deleted messages that were sent to the requester.
+        This method is invoked when another server proposes a leader ID that must be greater
+        than the current server's ID. The function ensures a thread-safe operation to update
+        the current leader ID using a lock, and then acknowledges the new leader proposal.
 
-        :param request: The GetMessagesRequest object.
-        :param context: The servicer context.
-        :rtype: GetMessagesResponse
+        :param request: The coordinator request containing the proposed leader ID.
+        :param context: The context object.
+        :return: Acknowledgment message confirming the new leader is recorded.
         """
-        self.inbound_volume += len(request.SerializeToString())
+        assert request.leader_id > self.server_id, "Leader ID must be larger than our own ID."
 
-        username = request.username
-        assert username in self.users
+        # Acquire the lock to set the leader ID
+        with self.lock:
+            # Apply any new commits
+            latest_commit_id = self.get_latest_commit_id()
+            new_commits = [commit for commit in request.commit_history if commit.id > latest_commit_id]
+            self.apply_commits(new_commits)
 
-        # Grab all messages associated with the user
-        message_ids = self.users[username].message_ids
-        messages = [self.messages[message_id] for message_id in message_ids]
+            # Set new leader
+            self.leader_id = request.leader_id
 
-        resp = GetMessagesResponse(status=Status.SUCCESS,
-                                   messages=messages)
-        self.outbound_volume += len(resp.SerializeToString())
+            print(f"[Server {self.server_id}] Acknowledging new leader: server {self.leader_id}")
 
-        if DEBUG:
-            self.log()
+        return Ack()
 
-        return resp
-
-    def ListUsers(self, request: ListUsersRequest, context: grpc.ServicerContext) -> ListUsersResponse:
+    def GetCommits(self,
+                   request: GetCommitsRequest,
+                   context: grpc.ServicerContext) -> GetCommitsResponse:
         """
-        This function handles all list users requests.
+        Handles the retrieval of commits based on the request provided. This method
+        processes the `GetCommitsRequest`, accesses the required resources, and returns
+        a `GetCommitsResponse` containing the details of the commits requested.
 
-        It responds with a list of all current users whose usernames match the provided wildcard pattern.
-
-        :param request: The ListUsersRequest object.
-        :param context: The servicer context.
-        :rtype: GetMessagesResponse
+        :param context: The get commits request.
+        :param request: The gRPC context object.
         """
-        self.inbound_volume += len(request.SerializeToString())
+        print(f"[Server {self.server_id}] Received get commits request from server {request.server_id}")
 
-        username, pattern = request.username, request.pattern
-        matches = [username for username in self.users if fnmatch(username, pattern)]
+        with self.lock:
+            with sqlite3.connect(self.db_file) as db:
+                cursor = db.execute("SELECT id, query FROM commits WHERE id > ? ORDER BY id",
+                                    (request.latest_commit_id,))
+                rows = cursor.fetchall()
 
-        resp = ListUsersResponse(status=Status.SUCCESS,
-                                 usernames=matches)
-        self.outbound_volume += len(resp.SerializeToString())
+        # Construct the commits list
+        commits = [Commit(row[0], row[1]) for row in rows]
+        return GetCommitsResponse(commits=commits)
 
-        if DEBUG:
-            self.log()
-
-        return resp
-
-    def SendMessage(self, request: SendMessageRequest, context: grpc.ServicerContext) -> SendMessageResponse:
+    def Election(self,
+                 request: ElectionRequest,
+                 context: grpc.ServicerContext) -> Ack:
         """
-        This function handles all send messages requests.
+        Handles the initiation of a leader election process among distributed servers.
 
-        It inserts the message into the map of message IDs to message objects.
-        Then it inserts the message ID into the recipient's message inbox.
-        On success, it responds with a blank SendMessageResponse() object.
+        This function is invoked to trigger a leader election in a distributed system
+        when a node with a lower ID requests for one. The election logic is
+        executed in a separate thread to ensure the gRPC server remains responsive.
+        The method returns an acknowledgment upon successful initiation of the
+        election process.
 
-        :param request: The SendMessageRequest object.
-        :param context: The servicer context.
-        :rtype: SendMessageResponse
+        :param request: The election request containing the candidate ID.
+        :param context: The gRPC context object.
+        :return: An acknowledgment that the election request has been received.
         """
-        self.inbound_volume += len(request.SerializeToString())
+        print(f"[Server {self.server_id}] Received election request from server {request.candidate_id}")
+        assert request.candidate_id < self.server_id, "Candidate ID must be smaller than our ID."
 
-        username, message = request.username, request.message
+        # Trigger an election start
+        t = threading.Thread(target=self.start_election,
+                             daemon=True)
+        t.start()
 
-        # Assert that the message does not already exist and the request user matches the sender
-        assert message.id not in self.messages
-        assert username == message.sender
+        return Ack()
 
-        if message.recipient not in self.users:
-            return SendMessageResponse(status=Status.ERROR,
-                                       error_message=f"Send message failed: recipient \"{message.recipient}\" does not exist.")
-
-        # Store the message
-        message_id = uuid.UUID(bytes=message.id)
-        self.messages[message_id] = message
-
-        # Add the message to the recipient's inbox
-        recipient = self.users[message.recipient]
-        recipient.add_message(message_id)
-
-        resp = SendMessageResponse(status=Status.SUCCESS)
-        self.outbound_volume += len(resp.SerializeToString())
-
-        if DEBUG:
-            self.log()
-
-        return resp
-
-    def ReadMessages(self, request: ReadMessagesRequest, context: grpc.ServicerContext) -> ReadMessagesResponse:
+    def Heartbeat(self,
+                  request: HeartbeatRequest,
+                  context: grpc.ServicerContext) -> Ack:
         """
-        This function handles all read messages requests.
+        Handles the heartbeat communication between the client and the server.
+        This method is invoked to ensure that the client-server connection
+        remains active and responsive. It processes the heartbeat request
+        from the client and returns an acknowledgment to confirm the connection
+        status.
 
-        It iterates over a list of message IDs.
-        For each message ID, it gets the message object corresponding to the message ID.
-        It sets the read flag of the message to true.
-        On success, it responds with a blank ReadMessageResponse() object.
-
-        :param request: The ReadMessagesRequest object.
-        :param context: The servicer context.
-        :rtype: ReadMessagesResponse
+        :param request: The heartbeat request.
+        :param context: The gRPC context object.
+        :return: An acknowledgment that the heartbeat was received.
         """
-        self.inbound_volume += len(request.SerializeToString())
+        return Ack()
 
-        username, message_ids = request.username, request.message_ids
+    def stop(self):
+        """Stop the heartbeat thread gracefully."""
+        self.shutdown.set()
+        self.heartbeat_thread.join()
 
-        # Set the read flag for each message in the request
-        for message_id in message_ids:
-            # Convert to UUID
-            message_id = uuid.UUID(bytes=message_id)
-            assert message_id in self.messages
+    def send_heartbeats(self):
+        """Periodically check if the leader is alive. If not, start an election."""
+        while not self.shutdown.is_set():
+            # Get the leader ID
+            with self.lock:
+                leader_id = self.leader_id
 
-            message = self.messages[message_id]
+            # No leader -> start election
+            if leader_id is None:
+                self.start_election()
+            elif leader_id != self.server_id:
+                try:
+                    # We have a known leader, check if it's alive
+                    assert isinstance(leader_id, int)
+                    addr = self.id_to_addr[leader_id]
 
-            # Assert that the recipient matches the request username
-            assert message.recipient == username
+                    # Make the RPC
+                    channel = grpc.insecure_channel(addr)
+                    stub = ChatStub(channel)
+                    stub.Heartbeat(HeartbeatRequest(server_id=self.server_id))
+                except grpc.RpcError as _:
+                    print(f"[Server {self.server_id}] Detected leader {self.leader_id} is unresponsive")
+                    with self.lock:
+                        self.leader_id = None
 
-            # Mark the message as read
-            assert not message.read
-            message.read = True
+            time.sleep(self.HEARTBEAT_INTERVAL)
 
-        resp = ReadMessagesResponse(status=Status.SUCCESS)
-        self.outbound_volume += len(resp.SerializeToString())
-
-        if DEBUG:
-            self.log()
-
-        return resp
-
-    def DeleteMessages(self, request: DeleteMessagesRequest, context: grpc.ServicerContext) -> DeleteMessagesResponse:
+    def start_election(self):
         """
-        This function handles all delete messages requests.
-
-        It iterates over a list of message IDs.
-        For each message ID, it gets the message object corresponding to the message ID.
-        It deletes the message object as well as the ID from the recipient's inbox.
-        On success, it responds with a blank DeleteMessagesResponse() object.
-
-        :param request: The DeleteMessagesRequest object.
-        :param context: The servicer context.
-        :rtype: DeleteMessagesResponse
+        Bully Algorithm approach:
+        1. Send an election request to all peers.
+        2. If none reject, then we become the leader.
+        3. If at least one accepts, then we are good to go.
         """
-        self.inbound_volume += len(request.SerializeToString())
+        # Check if an election is already in progress
+        with self.lock:
+            if self.election_in_progress:
+                return
 
-        username, message_ids = request.username, request.message_ids
+            # Clear the leader and start the election
+            self.leader_id = None
+            self.election_in_progress = True
 
-        # Get the recipient
-        recipient = self.users[username]
+        print(f"[Server {self.server_id}] Initiating election...")
 
-        # Delete the messages one by one
-        for message_id in message_ids:
-            # Convert to UUID
-            message_id = uuid.UUID(bytes=message_id)
-            assert message_id in self.messages
+        # Track if any peer with greater ID accepted our request
+        election_accepted = True
 
-            # Get the message to delete
-            message = self.messages[message_id]
+        # Send election requests
+        for peer_id, addr in self.id_to_addr.items():
+            if peer_id <= self.server_id:
+                continue
+            try:
+                # Build stub
+                channel = grpc.insecure_channel(addr)
+                stub = ChatStub(channel)
 
-            # Assert that the recipient matches the request username
-            assert message.recipient == username
+                # Send the request
+                request = ElectionRequest(candidate_id=self.server_id)
+                stub.Election(request=request,
+                              timeout=self.ELECTION_TIMEOUT)
 
-            # Delete the message from the recipient
-            recipient.delete_message(message_id)
+                # If they responded, then we will NOT be the new leader
+                election_accepted = False
+            except grpc.RpcError as _:
+                print(f"[Server {self.server_id}] Election request to {peer_id} failed to send")
 
-            # Delete the message
-            del self.messages[message_id]
+        # If no server rejected our request, then we become the new leader
+        if election_accepted:
+            with self.lock:
+                # Synchronize commit history with the other peers
+                self.synchronize_commits()
 
-        resp = DeleteMessagesResponse(status=Status.SUCCESS)
-        self.outbound_volume += len(resp.SerializeToString())
+                # Broadcast new coordinator
+                self.broadcast_coordinator()
 
-        if DEBUG:
-            self.log()
+                # Set new leader
+                self.leader_id = self.server_id
+                self.election_in_progress = False
 
-        return resp
+            print(f"[Server {self.server_id}] Elected server {self.leader_id} as leader.")
+        else:
+            # Just wait for a coordinator request
+            with self.lock:
+                self.election_in_progress = False
 
-    def DeleteUser(self, request: DeleteUserRequest, context: grpc.ServicerContext) -> DeleteUserResponse:
+    def init_db(self):
         """
-        This function handles all delete user requests.
+        Initializes the database for the server by connecting and setting up required tables.
 
-        It iterates over the list of message IDs in the deleted user's inbox.
-        For each message ID, it erases the corresponding message object.
-        The user is then removed from the server's state.
-        On success, it responds with a blank DeleteUserResponse() object.
-
-        :param request: The DeleteUserRequest object.
-        :param context: The servicer context.
-        :rtype: DeleteUserResponse
+        The method connects to a SQLite database file specific to the server instance,
+        with the file name based on the server id, and initializes tables for handling
+        commits, messages, and users. It ensures the tables are created if they do not
+        exist already and commits any changes to the database.
         """
-        self.inbound_volume += len(request.SerializeToString())
+        # Connect to the DB for this server
+        with sqlite3.connect(self.db_file) as db:
+            # Create the write-ahead log table
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS commits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query TEXT NOT NULL
+                )
+            """)
 
-        username = request.username
+            # Create the messages table
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id BLOB PRIMARY KEY,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    read BOOLEAN NOT NULL DEFAULT 0
+                );
+            """)
 
-        # Get the user
-        assert username in self.users
-        user = self.users[username]
+            # Create the users table
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password TEXT NOT NULL
+                )
+            """)
 
-        # Delete all messages sent to that user
-        for message_id in user.message_ids:
-            assert message_id in self.messages
-            del self.messages[message_id]
+            # Commit the changes.
+            db.commit()
 
-        # Delete the user
-        del self.users[username]
+    def synchronize_commits(self):
+        """
+        Synchronizes the commit records between the current server and its peer servers. For each peer
+        server, this function collects commits that occurred strictly after the local `latest_commit_id`
+        value. It then applies those commits to the local database. This ensures the local database
+        reflects the state of the distributed system's other nodes.
+        """
+        for peer_id, addr in self.id_to_addr.items():
+            if peer_id == self.server_id:
+                continue
+            try:
+                # Create stub
+                channel = grpc.insecure_channel(addr)
+                stub = ChatStub(channel)
 
-        resp = DeleteUserResponse(status=Status.SUCCESS)
-        self.outbound_volume += len(resp.SerializeToString())
+                # Retrieves all commits occurring strictly after `latest_commit_id`
+                request = GetCommitsRequest(server_id=self.server_id,
+                                            latest_commit_id=self.get_latest_commit_id())
+                response: GetCommitsResponse = stub.GetCommits(request)
 
-        if DEBUG:
-            self.log()
+                # Apply all the commits
+                self.apply_commits(list(response.commits))
+            except grpc.RpcError as _:
+                pass
 
-        return resp
+    def broadcast_coordinator(self):
+        """
+        Broadcasts the coordinator announcement to all peers in the network,
+        except the server itself. A gRPC channel is created for each peer,
+        and a CoordinatorRequest is sent to notify them about the current
+        leader and empty commit state.
 
-    def log(self):
-        """Utility function that logs the state of the server."""
-        print("\n-------------------------------- SERVER STATE --------------------------------")
-        print(f"USERS: {self.users}")
-        print(f"MESSAGES: {self.messages}")
-        print(f"TOTAL TRAFFIC (INBOUND): {self.inbound_volume} bytes")
-        print(f"TOTAL TRAFFIC (OUTBOUND): {self.outbound_volume} bytes")
-        print("------------------------------------------------------------------------------\n")
+        :param self: An instance of the class containing necessary information
+                     about server ID and peer addresses.
+
+        :raises grpc.RpcError: Exception occurs during the gRPC communication.
+        :return: None
+        """
+        commits = self.get_all_commits()
+
+        for peer_id, addr in self.id_to_addr.items():
+            if peer_id == self.server_id:
+                continue
+            try:
+                # Create stub
+                channel = grpc.insecure_channel(addr)
+                stub = ChatStub(channel)
+
+                # Announce coordinator
+                stub.Coordinator(CoordinatorRequest(leader_id=self.server_id,
+                                                    commit_history=commits))
+                print(f"[Server {self.server_id}] Sent coordinator announcement to {peer_id}")
+            except grpc.RpcError as _:
+                pass
+
+    def get_all_commits(self) -> list[Commit]:
+        """
+        Returns all rows from the commits table, sorted by their primary key (id).
+
+        :return: A list of `Commit` objects, sorted by ID.
+        """
+        with sqlite3.connect(self.db_file) as db:
+            cursor = db.execute("SELECT id, query FROM commits ORDER BY id")
+            rows = cursor.fetchall()
+
+        return [Commit(id=row[0], query=row[1]) for row in rows]
+
+    def get_latest_commit_id(self) -> int:
+        """
+        Retrieves the latest commit ID from the database.
+
+        This method connects to the SQLite database defined by the given `db_file`.
+        It executes a query to determine the maximum value of the `id` field in the
+        `commits` table, which corresponds to the latest commit ID. If there are
+        no commits in the database, the method returns 0. Otherwise, it returns
+        the maximum commit ID.
+
+        :return: The latest commit ID from the database, or 0 if there are no commits present.
+        """
+        with sqlite3.connect(self.db_file) as db:
+            cursor = db.execute("SELECT MAX(id) FROM commits")
+            result = cursor.fetchone()
+
+        return 0 if result[0] is None else result[0]
+
+    def apply_commits(self, commits: list[Commit]):
+        """
+        Applies a list of commits to the SQLite database.
+
+        This method takes a list of `Commit` objects and applies each commit by inserting
+        its details into the database and executing the associated SQL query. Once all commits
+        are successfully executed, the changes are committed to the database.
+
+        :param commits: A list of commits to apply
+        """
+        with sqlite3.connect(self.db_file) as db:
+            for commit in commits:
+                db.execute("INSERT INTO commits VALUES (?, ?)",
+                           (commit.id, commit.query))
+                db.execute(commit.query)
+            db.commit()
 
 
 def main():
-    # Initialize the server
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--id", type=int, required=True, help="Unique ID for this server.")
+    args = parser.parse_args()
+
+    # Fixed known addresses for 3-server cluster.
+    # Suppose all are on localhost with different ports. You can change to actual IP addresses.
+    id_to_addr = get_ip_to_addr_map()
+    server_id = args.id
+
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-    add_ChatServicer_to_server(ChatServer(), server)
-
-    # Check for public visibility
-    if not PUBLIC_STATUS:
-        host = LOCALHOST
-    else:
-        host = get_ipaddr()
-        if host is None:
-            print("Error: server IP address could not be found.")
-            exit(1)
-
-    # Bind the server to host:port
-    server_addr = f"{host}:{SERVER_PORT}"
-    server.add_insecure_port(server_addr)
+    add_ChatServicer_to_server(ChatServer(server_id), server)
+    server.add_insecure_port(id_to_addr[server_id])
     server.start()
 
-    print(f"Server listening on {server_addr}")
-    server.wait_for_termination()
-    server.log()
+    try:
+        while True:
+            time.sleep(5)  # Keep alive
+    except KeyboardInterrupt:
+        print(f"Server {server_id} shutting down...")
+        server.stop(0)
 
 
 if __name__ == "__main__":
