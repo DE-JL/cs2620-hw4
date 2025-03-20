@@ -1,4 +1,6 @@
 import argparse
+import json
+import os
 import sqlite3
 import threading
 import time
@@ -7,11 +9,11 @@ from concurrent import futures
 
 from protos.chat_pb2 import *
 from protos.chat_pb2_grpc import *
-from utils import get_ip_to_addr_map
+from utils import get_id_to_addr_map
 
 
 class ChatServer(ChatServicer):
-    """Server implementation for the bully election algorithm."""
+    """Server implementation."""
 
     HEARTBEAT_INTERVAL = 2
     ELECTION_TIMEOUT = 2
@@ -26,17 +28,24 @@ class ChatServer(ChatServicer):
         :param server_id: Unique identifier for the server.
         """
         self.server_id = server_id
-        self.id_to_addr = get_ip_to_addr_map()
+        self.id_to_addr = get_id_to_addr_map()
 
         # Initialize the database
-        self.db_file = f"server{self.server_id}.db"
+        self.db_file = f"db/server{self.server_id}.db"
+        os.makedirs("db", exist_ok=True)
         self.init_db()
+
+        # Storage of request IDs for uniqueness
+        self.request_ids = self.get_request_ids()
 
         # Initially, we don’t know the leader yet
         self.leader_id = None
 
         # For concurrency control
         self.lock = threading.Lock()
+
+        # Synchronize the state
+        self.synchronize_commits()
 
         # Start background heartbeat thread
         self.shutdown = threading.Event()
@@ -67,7 +76,10 @@ class ChatServer(ChatServicer):
         with self.lock:
             # Apply any new commits
             latest_commit_id = self.get_latest_commit_id()
-            new_commits = [commit for commit in request.commit_history if commit.id > latest_commit_id]
+            commit_history = list(request.commit_history)
+
+            # Get the new commits
+            new_commits = [commit for commit in commit_history if commit.id > latest_commit_id]
             self.apply_commits(new_commits)
 
             # Set new leader
@@ -125,6 +137,25 @@ class ChatServer(ChatServicer):
         t.start()
 
         return Ack()
+
+    def Execute(self,
+                request: ExecuteRequest,
+                context: grpc.ServicerContext) -> ExecuteResponse:
+        """
+        Processes an Execute request in a gRPC server and provides an acknowledgment response.
+        This function serves as a core component to handle execution requests, process the
+        necessary logic, and return a corresponding acknowledgment.
+
+        :param request: The execution request containing the query.
+        :param context: The gRPC context object.
+        :return: The response
+        """
+        print(f"[Server {self.server_id}] received request {request.request}")
+
+        with self.lock:
+            response = self.execute_request(request.request)
+
+        return ExecuteResponse(response=response)
 
     def Heartbeat(self,
                   request: HeartbeatRequest,
@@ -248,14 +279,14 @@ class ChatServer(ChatServicer):
             db.execute("""
                 CREATE TABLE IF NOT EXISTS commits (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    query TEXT NOT NULL
+                    request TEXT NOT NULL
                 )
             """)
 
             # Create the messages table
             db.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
-                    id BLOB PRIMARY KEY,
+                    id TEXT PRIMARY KEY,
                     sender TEXT NOT NULL,
                     recipient TEXT NOT NULL,
                     body TEXT NOT NULL,
@@ -300,6 +331,8 @@ class ChatServer(ChatServicer):
             except grpc.RpcError as _:
                 pass
 
+        print(f"[Server {self.server_id}] Synchronized commit history with peers")
+
     def broadcast_coordinator(self):
         """
         Broadcasts the coordinator announcement to all peers in the network,
@@ -337,10 +370,10 @@ class ChatServer(ChatServicer):
         :return: A list of `Commit` objects, sorted by ID.
         """
         with sqlite3.connect(self.db_file) as db:
-            cursor = db.execute("SELECT id, query FROM commits ORDER BY id")
+            cursor = db.execute("SELECT id, request FROM commits ORDER BY id")
             rows = cursor.fetchall()
 
-        return [Commit(id=row[0], query=row[1]) for row in rows]
+        return [Commit(id=row[0], request=row[1]) for row in rows]
 
     def get_latest_commit_id(self) -> int:
         """
@@ -370,12 +403,244 @@ class ChatServer(ChatServicer):
 
         :param commits: A list of commits to apply
         """
+        for commit in commits:
+            self.execute_request(commit.request)
+
+    def get_request_ids(self) -> set[str]:
+        """
+        Retrieve the set of unique request IDs from the commits table.
+
+        :return: A set of (string) IDs.
+        """
         with sqlite3.connect(self.db_file) as db:
-            for commit in commits:
-                db.execute("INSERT INTO commits VALUES (?, ?)",
-                           (commit.id, commit.query))
-                db.execute(commit.query)
+            cursor = db.execute("SELECT request FROM commits")
+            rows = cursor.fetchall()
+
+        request_ids = set()
+        for row in rows:
+            request = json.loads(row[0])
+            request_ids.add(request["id"])
+
+        return request_ids
+
+    def execute_request(self, request: str) -> str:
+        # Convert the request to a JSON object
+        request = json.loads(request)
+
+        # Check for duplicate IDs
+        if request["id"] in self.request_ids:
+            return ""
+
+        # Forward the request to the right handler
+        match request["request_type"]:
+            case "AUTH":
+                response = self.handle_auth(request)
+            case "GET_MESSAGES":
+                response = self.handle_get_messages(request)
+            case "LIST_USERS":
+                response = self.handle_list_users(request)
+            case "SEND_MESSAGE":
+                response = self.handle_send_message(request)
+            case "READ_MESSAGES":
+                response = self.handle_read_messages(request)
+            case "DELETE_MESSAGES":
+                response = self.handle_delete_messages(request)
+            case "DELETE_USER":
+                response = self.handle_delete_user(request)
+            case _:
+                raise ValueError("Invalid request type.")
+
+        # Remember the ID
+        self.request_ids.add(request["id"])
+
+        return json.dumps(response)
+
+    def handle_auth(self, request: dict) -> dict:
+        assert request["request_type"] == "AUTH"
+
+        # Grab username and password
+        username = request["username"]
+        password = request["password"]
+
+        if request["action_type"] == "CREATE_USER":
+            with sqlite3.connect(self.db_file) as db:
+                # First check whether the user already exists
+                cursor = db.execute("SELECT username FROM users WHERE username = ?",
+                                    (request["username"],))
+                if cursor.fetchone() is not None:
+                    return self.create_error("Username already exists.")
+
+                # Create the user
+                db.execute("INSERT INTO users VALUES (?, ?)",
+                           (username, password))
+                db.execute("INSERT INTO commits (request) VALUES (?)",
+                           (json.dumps(request),))
+                db.commit()
+
+                return {
+                    "status": "OK",
+                }
+        elif request["action_type"] == "LOGIN":
+            with sqlite3.connect(self.db_file) as db:
+                # Check if the passwords match
+                cursor = db.execute("SELECT password FROM users WHERE username = ?",
+                                    (request["username"],))
+                db_password, = cursor.fetchone()
+                if password != db_password:
+                    return self.create_error("Invalid username or password.")
+
+                return {
+                    "status": "OK",
+                }
+        else:
+            raise ValueError("Invalid authentication action type.")
+
+    def handle_get_messages(self, request: dict) -> dict:
+        assert request["request_type"] == "GET_MESSAGES"
+
+        # Get the username to fetch messages for
+        username = request["username"]
+
+        # Query the DB
+        with sqlite3.connect(self.db_file) as db:
+            cursor = db.execute("""
+                SELECT sender, body, timestamp, read
+                FROM messages
+                WHERE recipient = ?
+                ORDER BY timestamp
+            """, (username,))
+            rows = cursor.fetchall()
+
+        # Parse the messages
+        messages = [
+            {
+                "sender": sender,
+                "body": body,
+                "timestamp": timestamp,
+                "read": bool(read),
+            }
+            for (sender, body, timestamp, read) in rows
+        ]
+
+        return {
+            "status": "OK",
+            "messages": messages,
+        }
+
+    def handle_list_users(self, request: dict) -> dict:
+        assert request["request_type"] == "LIST_USERS"
+
+        # Get the wildcard pattern
+        pattern = request["pattern"]
+
+        # Query the DB
+        with sqlite3.connect(self.db_file) as db:
+            cursor = db.execute("SELECT username FROM users WHERE username GLOB ?",
+                                (pattern,))
+            rows = cursor.fetchall()
+
+        # Return the usernames
+        usernames = [row[0] for row in rows]
+
+        return {
+            "status": "OK",
+            "usernames": usernames,
+        }
+
+    def handle_send_message(self, request: dict) -> dict:
+        assert request["request_type"] == "SEND_MESSAGE"
+
+        # Grab the message contents
+        message = request["message"]
+        message_id = message["id"]
+        sender = message["sender"]
+        recipient = message["recipient"]
+        body = message["body"]
+        timestamp = message["timestamp"]
+
+        with sqlite3.connect(self.db_file) as db:
+            # First check whether the recipient exists
+            cursor = db.execute("SELECT username FROM users WHERE username = ?",
+                                (recipient,))
+            if cursor.fetchone() is None:
+                return self.create_error("Recipient does not exist.")
+
+            # Insert the new message into the DB
+            db.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                       (message_id, sender, recipient, body, timestamp))
+            db.execute("INSERT INTO commits (request) VALUES (?)",
+                       (json.dumps(request),))
             db.commit()
+
+        return {
+            "status": "OK",
+        }
+
+    def handle_read_messages(self, request: dict) -> dict:
+        assert request["request_type"] == "READ_MESSAGES"
+
+        # Grab the message IDs
+        message_ids: list[str] = request["message_ids"]
+
+        with sqlite3.connect(self.db_file) as db:
+            # Create a list of '?' placeholders
+            placeholders = ",".join(["?"] * len(message_ids))
+
+            # Query the DB
+            db.execute(f"UPDATE messages SET read = 1 WHERE id in ({placeholders})",
+                       message_ids)
+            db.execute("INSERT INTO commits (request) VALUES (?)",
+                       (json.dumps(request),))
+            db.commit()
+
+        return {
+            "status": "OK",
+        }
+
+    def handle_delete_messages(self, request: dict) -> dict:
+        assert request["request_type"] == "DELETE_MESSAGES"
+
+        # IDs of the messages to delete
+        message_ids = request["message_ids"]
+
+        with sqlite3.connect(self.db_file) as db:
+            # Create a list of '?' placeholders
+            placeholders = ",".join(["?"] * len(message_ids))
+
+            # Query the DB
+            db.execute(f"DELETE FROM messages WHERE id in ({placeholders})",
+                       message_ids)
+            db.execute("INSERT INTO commits (request) VALUES (?)",
+                       (json.dumps(request),))
+            db.commit()
+
+        return {
+            "status": "OK",
+        }
+
+    def handle_delete_user(self, request: dict) -> dict:
+        assert request["request_type"] == "DELETE_USER"
+
+        # Username of the user to delete
+        username = request["username"]
+
+        with sqlite3.connect(self.db_file) as db:
+            db.execute("DELETE FROM users WHERE username = ?",
+                       (username,))
+            db.execute("INSERT INTO commits (request) VALUES (?)",
+                       (json.dumps(request),))
+            db.commit()
+
+        return {
+            "status": "OK",
+        }
+
+    @staticmethod
+    def create_error(error_message: str) -> dict:
+        return {
+            "status": "ERROR",
+            "error_message": error_message,
+        }
 
 
 def main():
@@ -385,12 +650,22 @@ def main():
 
     # Fixed known addresses for 3-server cluster.
     # Suppose all are on localhost with different ports. You can change to actual IP addresses.
-    id_to_addr = get_ip_to_addr_map()
+    id_to_addr = get_id_to_addr_map()
     server_id = args.id
 
+    # Create the server and bind to addr
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+
+    # Bind the server
+    addr = id_to_addr[server_id]
+    print(f"[Server {server_id}] Binding to {addr}...")
+    if server.add_insecure_port(id_to_addr[server_id]) == 0:
+        raise ValueError(f"Failed to bind to port {id_to_addr[server_id]}")
+
+    # Add chat server
     add_ChatServicer_to_server(ChatServer(server_id), server)
-    server.add_insecure_port(id_to_addr[server_id])
+
+    # Start
     server.start()
 
     try:

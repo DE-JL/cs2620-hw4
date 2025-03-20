@@ -10,13 +10,10 @@ service Chat {
     rpc Election(ElectionRequest) returns (Ack);
 
     // Executes a query
-    rpc Execute(ExecuteRequest) returns (ExecuteRequest);
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 
     // Gets all commits after a specified commit ID
     rpc GetCommits(GetCommitsRequest) returns (GetCommitsResponse);
-
-    // Gets the ID of the server that this server thinks is the leader
-    rpc GetLeader(GetLeaderRequest) returns (GetLeaderResponse);
 
     // Called periodically to check if a server is alive
     rpc Heartbeat(HeartbeatRequest) returns (Ack);
@@ -25,8 +22,8 @@ service Chat {
 message Ack {}
 
 message Commit {
-    int32 id = 1;       // ID of the commit
-    string query = 2;   // The query (JSON-string)
+    int32 id = 1;           // ID of the commit
+    string request = 2;     // The request (JSON-string)
 }
 
 message CoordinatorRequest {
@@ -39,8 +36,11 @@ message ElectionRequest {
 }
 
 message ExecuteRequest {
-    int32 leader_id = 1;    // ID of the leader forwarding the request
-    string query = 2;       // The JSON-string of the query
+    string request = 1;     // The request JSON-string
+}
+
+message ExecuteResponse {
+    string response = 1;    // The response JSON-string
 }
 
 message GetCommitsRequest {
@@ -50,14 +50,6 @@ message GetCommitsRequest {
 
 message GetCommitsResponse {
     repeated Commit commits = 2;    // The commits requested
-}
-
-message GetLeaderRequest {
-    int32 server_id = 1;    // ID of the server to query
-}
-
-message GetLeaderResponse {
-    int32 leader_id = 1;    // ID of who the server thinks is the leader
 }
 
 message HeartbeatRequest {

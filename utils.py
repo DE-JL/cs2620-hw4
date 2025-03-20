@@ -22,16 +22,16 @@ def get_ipaddr() -> str | None:
         return None
 
 
-def get_ip_to_addr_map() -> dict[int, str]:
+def get_id_to_addr_map() -> dict[int, str]:
     """
     Generates and returns a mapping of server IDs to their corresponding IP addresses and ports.
 
     :return: A map from server ID to their address.
     """
-    ip_to_addr: dict[int, str] = {}
+    id_to_addr: dict[int, str] = {}
     ipaddr = get_ipaddr() if PUBLIC_STATUS else LOCALHOST
 
     for server_id, port in SERVER_PORTS.items():
-        ip_to_addr[server_id] = f"{ipaddr}:{SERVER_PORTS[server_id]}"
+        id_to_addr[server_id] = f"{ipaddr}:{SERVER_PORTS[server_id]}"
 
-    return ip_to_addr
+    return id_to_addr

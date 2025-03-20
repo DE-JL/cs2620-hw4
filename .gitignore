@@ -1,4 +1,5 @@
 # Application data
+db/
 *.db
 
 # Protocol buffer generated code
