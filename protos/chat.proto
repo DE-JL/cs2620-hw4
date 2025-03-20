@@ -49,7 +49,7 @@ message GetCommitsRequest {
 }
 
 message GetCommitsResponse {
-    repeated Commit commits = 2;    // The commits requested
+    repeated Commit commits = 1;    // The commits requested
 }
 
 message HeartbeatRequest {

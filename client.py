@@ -1,53 +1,162 @@
-import json
 import uuid
 
-from protos.chat_pb2 import *
-from protos.chat_pb2_grpc import *
-
-from utils import get_id_to_addr_map
+from api import *
 
 
-def send_request(request: dict):
-    id_to_addr = get_id_to_addr_map()
+def test_auth():
+    # Login to a user that doesn't exist
+    exp = {
+        "status": "ERROR",
+        "error_message": "Invalid username or password.",
+    }
+    resp = login("jason", "password")
+    assert resp == exp
 
-    for server_id, addr in id_to_addr.items():
-        # Connect
-        channel = grpc.insecure_channel(addr)
-        stub = ChatStub(channel)
+    # Create a user
+    exp = {
+        "status": "OK",
+    }
+    resp = create_user("jason", "password")
+    assert resp == exp
 
-        # Send the request
-        print(f"Sending request to server {server_id}")
-        response = stub.Execute(ExecuteRequest(request=json.dumps(request)))
-        print(response)
+    # Create the same user (should fail)
+    exp = {
+        "status": "ERROR",
+        "error_message": "Username already exists.",
+    }
+    resp = create_user("jason", "password")
+    assert resp == exp
 
-        # Parse the response
-        response = json.loads(response.response)
-        print(f"Received response from server {server_id}: {response}")
+    # Successfully login
+    exp = {
+        "status": "OK",
+    }
+    resp = login("jason", "password")
+    assert resp == exp
+
+    # Wrong password
+    exp = {
+        "status": "ERROR",
+        "error_message": "Invalid username or password.",
+    }
+    resp = login("jason", "wrongpassword")
+    assert resp == exp
 
 
-def create_user(username: str, password: str):
-    request = {
+def test_get_and_send():
+    # Test sending to a nonexistent recipient
+    msg0 = {
         "id": str(uuid.uuid4()),
-        "request_type": "AUTH",
-        "action_type": "CREATE_USER",
-        "username": username,
-        "password": password,
+        "sender": "jason",
+        "recipient": "daniel",
+        "body": "Hello, world!",
+        "timestamp": 0,
     }
-    send_request(request)
+    exp = {
+        "status": "ERROR",
+        "error_message": "Recipient does not exist.",
+    }
+    resp = send_message(msg0)
+    assert resp == exp
+
+    # Send some messages
+    msg1 = {
+        "id": str(uuid.uuid4()),
+        "sender": "daniel",
+        "recipient": "jason",
+        "body": "Hello world!",
+        "timestamp": 1.0,
+        "read": False,
+    }
+    msg2 = {
+        "id": str(uuid.uuid4()),
+        "sender": "daniel",
+        "recipient": "jason",
+        "body": "Goodbye world!",
+        "timestamp": 2.0,
+        "read": False,
+    }
+    assert send_message(msg1) == {"status": "OK"}
+    assert send_message(msg2) == {"status": "OK"}
+
+    # Fetch the messages
+    exp = {
+        "status": "OK",
+        "messages": [msg1, msg2],
+    }
+    resp = get_messages("jason")
+    assert resp == exp
 
 
-def login(username: str, password: str):
-    request = {
-        "id": uuid.uuid4(),
-        "action_type": "LOGIN",
-        "username": username,
-        "password": password,
+def test_list_users():
+    # Match
+    exp = {
+        "status": "OK",
+        "usernames": ["jason"],
     }
-    send_request(request)
+    resp = list_users("j*")
+    assert resp == exp
+
+    # No matches
+    exp = {
+        "status": "OK",
+        "usernames": [],
+    }
+    resp = list_users("z*")
+    assert resp == exp
+
+
+def test_read_messages():
+    # Get all messages for "jason"
+    resp = get_messages("jason")
+    msgs = resp["messages"]
+
+    # Get the message IDs and send a read request
+    msg_ids = [msg["id"] for msg in msgs]
+    assert read_message(msg_ids) == {"status": "OK"}
+
+    # Fetch messages again and assert that their status has changed
+    resp = get_messages("jason")
+    msgs = resp["messages"]
+    for msg in msgs:
+        assert msg["read"] == True
+
+
+def test_delete_messages():
+    # Get all messages for "jason"
+    resp = get_messages("jason")
+    msgs = resp["messages"]
+
+    # Delete the messages
+    msg_ids = [msg["id"] for msg in msgs]
+    assert delete_message(msg_ids) == {"status": "OK"}
+
+    resp = get_messages("jason")
+    msgs = resp["messages"]
+    assert msgs == []
+
+
+def test_delete_user():
+    # Delete jason
+    resp = delete_user("jason")
+    assert resp == {"status": "OK"}
+
+    # Fetch all the users
+    exp = {
+        "status": "OK",
+        "usernames": [],
+    }
+    resp = list_users("*")
+    assert resp == exp
 
 
 def main():
-    create_user("jason", "password")
+    test_auth()
+    test_get_and_send()
+    test_list_users()
+    test_read_messages()
+    test_delete_messages()
+    test_delete_user()
 
 
 if __name__ == "__main__":

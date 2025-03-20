@@ -18,7 +18,7 @@ class ChatServer(ChatServicer):
     HEARTBEAT_INTERVAL = 2
     ELECTION_TIMEOUT = 2
 
-    def __init__(self, server_id: int):
+    def __init__(self, server_id: int, reset: bool = False):
         """
         Represents a server instance in a distributed system that manages communication,
         concurrency, and leader election processes. It provides initialization to set
@@ -33,7 +33,7 @@ class ChatServer(ChatServicer):
         # Initialize the database
         self.db_file = f"db/server{self.server_id}.db"
         os.makedirs("db", exist_ok=True)
-        self.init_db()
+        self.init_db(reset)
 
         # Storage of request IDs for uniqueness
         self.request_ids = self.get_request_ids()
@@ -102,14 +102,14 @@ class ChatServer(ChatServicer):
         """
         print(f"[Server {self.server_id}] Received get commits request from server {request.server_id}")
 
-        with self.lock:
-            with sqlite3.connect(self.db_file) as db:
-                cursor = db.execute("SELECT id, query FROM commits WHERE id > ? ORDER BY id",
-                                    (request.latest_commit_id,))
-                rows = cursor.fetchall()
+        with self.lock, sqlite3.connect(self.db_file) as db:
+            cursor = db.execute("SELECT id, request FROM commits WHERE id > ? ORDER BY id",
+                                (request.latest_commit_id,))
+            rows = cursor.fetchall()
 
         # Construct the commits list
-        commits = [Commit(row[0], row[1]) for row in rows]
+        commits = [Commit(id=row[0], request=row[1]) for row in rows]
+
         return GetCommitsResponse(commits=commits)
 
     def Election(self,
@@ -150,7 +150,8 @@ class ChatServer(ChatServicer):
         :param context: The gRPC context object.
         :return: The response
         """
-        print(f"[Server {self.server_id}] received request {request.request}")
+        request_obj = json.loads(request.request)
+        print(f"[Server {self.server_id}] Received request: {json.dumps(request_obj, indent=4)}\n")
 
         with self.lock:
             response = self.execute_request(request.request)
@@ -194,7 +195,7 @@ class ChatServer(ChatServicer):
                     assert isinstance(leader_id, int)
                     addr = self.id_to_addr[leader_id]
 
-                    # Make the RPC
+                    # Send a heartbeat request
                     channel = grpc.insecure_channel(addr)
                     stub = ChatStub(channel)
                     stub.Heartbeat(HeartbeatRequest(server_id=self.server_id))
@@ -264,7 +265,7 @@ class ChatServer(ChatServicer):
             with self.lock:
                 self.election_in_progress = False
 
-    def init_db(self):
+    def init_db(self, reset: bool):
         """
         Initializes the database for the server by connecting and setting up required tables.
 
@@ -273,6 +274,14 @@ class ChatServer(ChatServicer):
         commits, messages, and users. It ensures the tables are created if they do not
         exist already and commits any changes to the database.
         """
+        # If reset is true then delete all the tables
+        if reset:
+            with sqlite3.connect(self.db_file) as db:
+                db.execute("DROP TABLE IF EXISTS commits")
+                db.execute("DROP TABLE IF EXISTS messages")
+                db.execute("DROP TABLE IF EXISTS users")
+                db.commit()
+
         # Connect to the DB for this server
         with sqlite3.connect(self.db_file) as db:
             # Create the write-ahead log table
@@ -326,8 +335,12 @@ class ChatServer(ChatServicer):
                                             latest_commit_id=self.get_latest_commit_id())
                 response: GetCommitsResponse = stub.GetCommits(request)
 
+                # Parse the new commits
+                new_commits = list(response.commits)
+                print(f"[Server {self.server_id}] Received {len(new_commits)} commits from {peer_id}")
+
                 # Apply all the commits
-                self.apply_commits(list(response.commits))
+                self.apply_commits(new_commits)
             except grpc.RpcError as _:
                 pass
 
@@ -433,8 +446,10 @@ class ChatServer(ChatServicer):
 
         # Forward the request to the right handler
         match request["request_type"]:
-            case "AUTH":
-                response = self.handle_auth(request)
+            case "CREATE_USER":
+                response = self.handle_create_user(request)
+            case "LOGIN":
+                response = self.handle_login(request)
             case "GET_MESSAGES":
                 response = self.handle_get_messages(request)
             case "LIST_USERS":
@@ -455,45 +470,51 @@ class ChatServer(ChatServicer):
 
         return json.dumps(response)
 
-    def handle_auth(self, request: dict) -> dict:
-        assert request["request_type"] == "AUTH"
+    def handle_create_user(self, request: dict) -> dict:
+        assert request["request_type"] == "CREATE_USER"
 
-        # Grab username and password
+        # Get the username and password
         username = request["username"]
         password = request["password"]
 
-        if request["action_type"] == "CREATE_USER":
-            with sqlite3.connect(self.db_file) as db:
-                # First check whether the user already exists
-                cursor = db.execute("SELECT username FROM users WHERE username = ?",
-                                    (request["username"],))
-                if cursor.fetchone() is not None:
-                    return self.create_error("Username already exists.")
+        with sqlite3.connect(self.db_file) as db:
+            # First check whether the user already exists
+            cursor = db.execute("SELECT username FROM users WHERE username = ?",
+                                (request["username"],))
+            if cursor.fetchone() is not None:
+                return self.create_error("Username already exists.")
 
-                # Create the user
-                db.execute("INSERT INTO users VALUES (?, ?)",
-                           (username, password))
-                db.execute("INSERT INTO commits (request) VALUES (?)",
-                           (json.dumps(request),))
-                db.commit()
+            # Create the user
+            db.execute("INSERT INTO users VALUES (?, ?)",
+                       (username, password))
+            db.execute("INSERT INTO commits (request) VALUES (?)",
+                       (json.dumps(request),))
+            db.commit()
 
-                return {
-                    "status": "OK",
-                }
-        elif request["action_type"] == "LOGIN":
-            with sqlite3.connect(self.db_file) as db:
-                # Check if the passwords match
-                cursor = db.execute("SELECT password FROM users WHERE username = ?",
-                                    (request["username"],))
-                db_password, = cursor.fetchone()
-                if password != db_password:
-                    return self.create_error("Invalid username or password.")
+        return {
+            "status": "OK",
+        }
 
-                return {
-                    "status": "OK",
-                }
-        else:
-            raise ValueError("Invalid authentication action type.")
+    def handle_login(self, request: dict) -> dict:
+        assert request["request_type"] == "LOGIN"
+
+        # Get the username and password
+        username = request["username"]
+        password = request["password"]
+
+        with sqlite3.connect(self.db_file) as db:
+            # Query for the password
+            cursor = db.execute("SELECT password FROM users WHERE username = ?",
+                                (username,))
+            row = cursor.fetchone()
+
+            # If the user doesn't exist or the passwords don't match, return error
+            if row is None or password != row[0]:
+                return self.create_error("Invalid username or password.")
+
+        return {
+            "status": "OK",
+        }
 
     def handle_get_messages(self, request: dict) -> dict:
         assert request["request_type"] == "GET_MESSAGES"
@@ -504,7 +525,7 @@ class ChatServer(ChatServicer):
         # Query the DB
         with sqlite3.connect(self.db_file) as db:
             cursor = db.execute("""
-                SELECT sender, body, timestamp, read
+                SELECT id, sender, recipient, body, timestamp, read
                 FROM messages
                 WHERE recipient = ?
                 ORDER BY timestamp
@@ -514,12 +535,14 @@ class ChatServer(ChatServicer):
         # Parse the messages
         messages = [
             {
+                "id": message_id,
                 "sender": sender,
+                "recipient": recipient,
                 "body": body,
                 "timestamp": timestamp,
                 "read": bool(read),
             }
-            for (sender, body, timestamp, read) in rows
+            for (message_id, sender, recipient, body, timestamp, read) in rows
         ]
 
         return {
@@ -566,8 +589,10 @@ class ChatServer(ChatServicer):
                 return self.create_error("Recipient does not exist.")
 
             # Insert the new message into the DB
-            db.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
-                       (message_id, sender, recipient, body, timestamp))
+            db.execute("""
+                INSERT INTO messages (id, sender, recipient, body, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (message_id, sender, recipient, body, timestamp))
             db.execute("INSERT INTO commits (request) VALUES (?)",
                        (json.dumps(request),))
             db.commit()
@@ -646,34 +671,35 @@ class ChatServer(ChatServicer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", type=int, required=True, help="Unique ID for this server.")
+    parser.add_argument("--reset", action="store_true", help="Reset the database if specified.")
     args = parser.parse_args()
 
-    # Fixed known addresses for 3-server cluster.
-    # Suppose all are on localhost with different ports. You can change to actual IP addresses.
-    id_to_addr = get_id_to_addr_map()
+    # Get the args
     server_id = args.id
+    reset = args.reset
+
+    # Map from server ID -> IP address and port
+    id_to_addr = get_id_to_addr_map()
 
     # Create the server and bind to addr
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
 
     # Bind the server
     addr = id_to_addr[server_id]
-    print(f"[Server {server_id}] Binding to {addr}...")
     if server.add_insecure_port(id_to_addr[server_id]) == 0:
         raise ValueError(f"Failed to bind to port {id_to_addr[server_id]}")
+    print(f"[Server {server_id}] Bound to {addr}...")
 
     # Add chat server
-    add_ChatServicer_to_server(ChatServer(server_id), server)
-
-    # Start
+    chat_server = ChatServer(server_id, reset)
+    add_ChatServicer_to_server(chat_server, server)
     server.start()
 
     try:
-        while True:
-            time.sleep(5)  # Keep alive
+        server.wait_for_termination()
     except KeyboardInterrupt:
-        print(f"Server {server_id} shutting down...")
-        server.stop(0)
+        chat_server.shutdown.set()
+        server.stop(3)
 
 
 if __name__ == "__main__":
