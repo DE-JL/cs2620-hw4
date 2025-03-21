@@ -8,7 +8,6 @@ from PyQt5.QtWidgets import QPushButton
 from PyQt5.QtWidgets import QLineEdit
 
 
-
 class ViewMessage(QWidget):
     """
     View message class for viewing the delivered count and reading/deleting messages.
@@ -51,10 +50,10 @@ class ViewMessage(QWidget):
 
     def update_message_list(self, messages: list):
         # Get the set if message IDs of selected messages
-        selected_ids = set()
+        selected_ids: set[str] = set()
         for item in self.message_list.selectedItems():
-            msg = item.data(Qt.UserRole)
-            selected_ids.add(msg.id)
+            message = item.data(Qt.UserRole)
+            selected_ids.add(message["id"])
 
         # Block UI updates
         self.message_list.blockSignals(True)
@@ -63,15 +62,15 @@ class ViewMessage(QWidget):
         # Rerender each message one by one
         num_unread = 0
         for message in messages:
-            if not message.read:
+            if not message["read"]:
                 num_unread += 1
                 continue
 
             # Convert timestamp to a readable string
-            time_str = datetime.fromtimestamp(message.timestamp).strftime('%Y-%m-%d %H:%M:%S')
+            time_str = datetime.fromtimestamp(message["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
 
             # Create a display string
-            display_text = f"[{time_str}] {message.sender}: {message.body}"
+            display_text = f"[{time_str}] {message["sender"]}: {message["body"]}"
 
             # Create a list item
             item = QListWidgetItem(display_text)
@@ -81,7 +80,7 @@ class ViewMessage(QWidget):
             self.message_list.addItem(item)
 
             # Make sure previously selected items are selected
-            if message.id in selected_ids:
+            if message["id"] in selected_ids:
                 item.setSelected(True)
 
         # Unblock UI updates

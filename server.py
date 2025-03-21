@@ -190,6 +190,7 @@ class ChatServer(ChatServicer):
             if leader_id is None:
                 self.start_election()
             elif leader_id != self.server_id:
+                channel = None
                 try:
                     # We have a known leader, check if it's alive
                     assert isinstance(leader_id, int)
@@ -203,6 +204,9 @@ class ChatServer(ChatServicer):
                     print(f"[Server {self.server_id}] Detected leader {self.leader_id} is unresponsive")
                     with self.lock:
                         self.leader_id = None
+                finally:
+                    if channel is not None:
+                        channel.close()
 
             time.sleep(self.HEARTBEAT_INTERVAL)
 
@@ -231,8 +235,10 @@ class ChatServer(ChatServicer):
         for peer_id, addr in self.id_to_addr.items():
             if peer_id <= self.server_id:
                 continue
+
+            channel = None
             try:
-                # Build stub
+                # Connect to peer
                 channel = grpc.insecure_channel(addr)
                 stub = ChatStub(channel)
 
@@ -245,6 +251,9 @@ class ChatServer(ChatServicer):
                 election_accepted = False
             except grpc.RpcError as _:
                 print(f"[Server {self.server_id}] Election request to {peer_id} failed to send")
+            finally:
+                if channel is not None:
+                    channel.close()
 
         # If no server rejected our request, then we become the new leader
         if election_accepted:
@@ -325,6 +334,8 @@ class ChatServer(ChatServicer):
         for peer_id, addr in self.id_to_addr.items():
             if peer_id == self.server_id:
                 continue
+
+            channel = None
             try:
                 # Create stub
                 channel = grpc.insecure_channel(addr)
@@ -343,6 +354,9 @@ class ChatServer(ChatServicer):
                 self.apply_commits(new_commits)
             except grpc.RpcError as _:
                 pass
+            finally:
+                if channel is not None:
+                    channel.close()
 
         print(f"[Server {self.server_id}] Synchronized commit history with peers")
 
@@ -364,8 +378,10 @@ class ChatServer(ChatServicer):
         for peer_id, addr in self.id_to_addr.items():
             if peer_id == self.server_id:
                 continue
+
+            channel = None
             try:
-                # Create stub
+                # Connect to peer
                 channel = grpc.insecure_channel(addr)
                 stub = ChatStub(channel)
 
@@ -375,6 +391,9 @@ class ChatServer(ChatServicer):
                 print(f"[Server {self.server_id}] Sent coordinator announcement to {peer_id}")
             except grpc.RpcError as _:
                 pass
+            finally:
+                if channel is not None:
+                    channel.close()
 
     def get_all_commits(self) -> list[Commit]:
         """
@@ -528,7 +547,7 @@ class ChatServer(ChatServicer):
                 SELECT id, sender, recipient, body, timestamp, read
                 FROM messages
                 WHERE recipient = ?
-                ORDER BY timestamp
+                ORDER BY timestamp DESC
             """, (username,))
             rows = cursor.fetchall()
 

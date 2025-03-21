@@ -113,7 +113,7 @@ def test_read_messages():
 
     # Get the message IDs and send a read request
     msg_ids = [msg["id"] for msg in msgs]
-    assert read_message(msg_ids) == {"status": "OK"}
+    assert read_messages(msg_ids) == {"status": "OK"}
 
     # Fetch messages again and assert that their status has changed
     resp = get_messages("jason")
@@ -129,7 +129,7 @@ def test_delete_messages():
 
     # Delete the messages
     msg_ids = [msg["id"] for msg in msgs]
-    assert delete_message(msg_ids) == {"status": "OK"}
+    assert delete_messages(msg_ids) == {"status": "OK"}
 
     resp = get_messages("jason")
     msgs = resp["messages"]

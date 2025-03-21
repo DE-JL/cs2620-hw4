@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import threading
 import uuid
 import time
 
@@ -11,48 +12,40 @@ from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 from PyQt5.QtCore import QThread
 from sys import argv
 
+import api
+
 from config import GUI_REFRESH_RATE
-from protos.chat_pb2 import *
-from protos.chat_pb2_grpc import *
 from ui import MainFrame
 
 
 class UserSession:
     """
-    A class to represent a socket-based user session
+    Represents a user's session for interacting with the server and managing
+    user interactions in the application's main GUI.
     """
 
-    def __init__(self, host: str, port: int, mainframe: MainFrame, window: QMainWindow):
+    def __init__(self, mainframe: MainFrame, window: QMainWindow, server_addr: str):
         """
         Initialize a UserSession instance.
 
-        :param host: The hostname or IP address of the server
-        :param port: The port number to connect to the server on
-        :param mainframe: The main application frame
-        :param window: The main application window
+        :param mainframe: The main application frame.
+        :param window: The main application window.
+        :param server_addr: The server IP address.
         """
+        # GUI
         self.mainframe = mainframe
         self.window = window
+
+        # IP address of the server
+        self.server_addr = server_addr
+
+        # Username of the logged-in user
         self.username = None
 
-        self.host = host
-        self.port = port
-        self.channel = None
-        self.stub = None
-
+        # Message fetching
         self.message_thread = None
         self.message_worker = None
         self.messages = None
-
-        # Initialize connection for main GUI thread
-        try:
-            server_addr = f"{self.host}:{self.port}"
-            self.channel = grpc.insecure_channel(server_addr)
-            self.stub = ChatStub(self.channel)
-        except Exception as e:
-            print("Connection refused. Please check if the server is running.")
-            print(e)
-            exit(1)
 
         # Register event handlers
         self.mainframe.login.login_button.clicked.connect(self.login_user)
@@ -72,26 +65,13 @@ class UserSession:
         socket connection to the server. This method should be called when the
         client is finished interacting with the server.
         """
-        self.channel.close()
-        self.channel = None
-        self.stub = None
+        pass
 
-    def authenticate_user(self, action):
+    def authenticate_user(self, request_type: str):
         """
         Authenticate the user with the given action type.
 
-        This method will attempt to authenticate the user with the given action type
-        (either AuthRequest.ActionType.LOGIN or AuthRequest.ActionType.CREATE_ACCOUNT).
-        If the authentication is successful, the client will enter the logged in state.
-
-        If the client is running in debug mode and the username is "admin" and the
-        password is "pass", the client will automatically be authenticated and enter
-        the logged in state.
-
-        If the authentication fails, the client will display an error message to the user.
-
-        :param action: The action type to use for authentication.
-        :type action: api.AuthRequest.ActionType
+        :param request_type: The request type to use for authentication.
         """
         print("Authenticating user...")
         username = self.mainframe.login.user_entry.text()
@@ -103,19 +83,27 @@ class UserSession:
             return
 
         # Hash the password
-        hashed_password = hash_string(password)
+        password = hash_string(password)
 
-        response = self.stub.Authenticate(AuthRequest(action_type=action, username=username, password=hashed_password))
+        # Switch on the request type
+        if request_type == "CREATE_USER":
+            response = api.create_user(username, password, self.server_addr)
+        elif request_type == "LOGIN":
+            response = api.login(username, password, self.server_addr)
+        else:
+            raise ValueError(f"Invalid request type: {request_type}")
 
-        if response.status == Status.ERROR:
-            QMessageBox.critical(self.window, 'Error', response.error_message)
+        # Check for authentication errors
+        if response["status"] == "ERROR":
+            QMessageBox.critical(self.window, 'Error', response["error_message"])
             return
 
         print("Authentication successful")
 
-        # hide the login frame
+        # Hide the login frame
         self.mainframe.login.hide()
-        # show logged in frame
+
+        # Show logged in frame
         self.mainframe.logged_in.show()
         self.mainframe.central.show()
         self.mainframe.view_messages.show()
@@ -125,10 +113,10 @@ class UserSession:
         self.start_logged_session()
 
     def sign_up(self):
-        self.authenticate_user(AuthRequest.ActionType.CREATE_ACCOUNT)
+        self.authenticate_user("CREATE_USER")
 
     def login_user(self):
-        self.authenticate_user(AuthRequest.ActionType.LOGIN)
+        self.authenticate_user("LOGIN")
 
     def sign_out(self):
         """
@@ -160,18 +148,21 @@ class UserSession:
         response is an error, it displays an error box with the response
         message. If the response is not an error, it successfully deletes the
         user's account and signs the user out.
-
-        :return: None
         """
+        # Save the username
         user_to_delete = self.username
 
+        # Sign out
         self.sign_out()
 
-        response = self.stub.DeleteUser(DeleteUserRequest(username=user_to_delete))
+        # Send the delete user request
+        response = api.delete_user(user_to_delete, self.server_addr)
 
-        if response.status == Status.ERROR:
-            QMessageBox.critical(self.window, 'Error', response.error_message)
+        # Check for errors
+        if response["status"] == "ERROR":
+            QMessageBox.critical(self.window, 'Error', response["error_message"])
             return
+
         print("Account deleted")
 
     def list_account_event(self):
@@ -184,19 +175,21 @@ class UserSession:
         error, it displays an error box with the response message. If the response is not
         an error, it clears the list widget and populates it with the usernames returned
         in the response.
-
-        :return: None
         """
-        search_string = self.mainframe.central.list_account.search_entry.text()
+        # Grab the glob pattern
+        pattern = self.mainframe.central.list_account.search_entry.text()
 
-        response = self.stub.ListUsers(ListUsersRequest(username=self.username, pattern=search_string))
+        # Send the request
+        response = api.list_users(pattern, self.server_addr)
 
-        if response.status == Status.ERROR:
-            QMessageBox.critical(self.window, 'Error', response.error_message)
+        # Check for errors
+        if response["status"] == "ERROR":
+            QMessageBox.critical(self.window, "Error", response["error_message"])
             return
 
+        # Clear the usernames and display the new ones
         self.mainframe.central.list_account.account_list.clear()
-        for idx, user in enumerate(response.usernames):
+        for idx, user in enumerate(response["usernames"]):
             self.mainframe.central.list_account.account_list.insertItem(idx, user)
 
     def send_message_event(self):
@@ -209,25 +202,27 @@ class UserSession:
         message object and the currently logged-in user's username. If the response is an
         error, it displays an error box with the response message. If the response is not
         an error, it clears all the fields in the send message frame.
-
-        :return: None
         """
+        # Parse the recipient and the message body
         recipient = self.mainframe.central.send_message.recipient_entry.text()
         message_body = self.mainframe.central.send_message.message_text.toPlainText()
 
-        message = Message(id=uuid.uuid4().bytes,
-                          sender=self.username,
-                          recipient=recipient,
-                          body=message_body,
-                          timestamp=time.time())
-        req = SendMessageRequest(username=self.username, message=message)
+        # Create the message object and send it to the server
+        message = {
+            "id": str(uuid.uuid4()),
+            "sender": self.username,
+            "recipient": recipient,
+            "body": message_body,
+            "timestamp": time.time(),
+        }
+        response = api.send_message(message, self.server_addr)
 
-        response = self.stub.SendMessage(req)
-
-        if response.status == Status.ERROR:
-            QMessageBox.critical(self.window, 'Error', response.error_message)
+        # Check for errors
+        if response["status"] == "ERROR":
+            QMessageBox.critical(self.window, "Error", response["error_message"])
             return
 
+        # Clear the input fields
         clear_all_fields(self.mainframe.central.send_message)
 
     def handle_new_messages(self, messages):
@@ -239,11 +234,8 @@ class UserSession:
         descending order, and updates the messages list in the view messages frame.
 
         :param messages: The list of messages retrieved from the server.
-        :type messages: list[Message]
-        :return: None
         """
         self.messages = messages
-        self.messages.sort(key=lambda x: x.timestamp, reverse=True)
         self.mainframe.view_messages.update_message_list(self.messages)
 
     def delete_messages_event(self):
@@ -255,24 +247,26 @@ class UserSession:
         and the currently logged-in user's username. It then sends the request to the server.
         If the response is an error, it displays an error box with the response message.
         If the response is not an error, it clears the messages list in the view messages frame.
-
-        :return: None
         """
+        # Grab the selected items
         selected_items = self.mainframe.view_messages.message_list.selectedItems()
         if not selected_items:
             print("No messages selected")
-            return  # Nothing to delete
+            return
 
-        ids_to_delete = []
+        # Get the IDs of the selected messages (strings)
+        message_ids = []
         for item in selected_items:
             # Retrieve the original Message object
-            msg = item.data(Qt.UserRole)
-            ids_to_delete.append(msg.id)
+            message = item.data(Qt.UserRole)
+            message_ids.append(message["id"])
 
-        response = self.stub.DeleteMessages(DeleteMessagesRequest(username=self.username, message_ids=ids_to_delete))
+        # Send the request
+        response = api.delete_messages(message_ids, self.server_addr)
 
-        if response.status == Status.ERROR:
-            QMessageBox.critical(self.window, 'Error', response.error_message)
+        # Check for errors
+        if response["status"] == "ERROR":
+            QMessageBox.critical(self.window, "Error", response["error_message"])
             return
 
     def read_messages_event(self):
@@ -285,32 +279,33 @@ class UserSession:
         If the response is an error, it displays an error box with the response message.
         If the response is not an error, it updates the messages list in the view messages frame
         to mark the messages as read.
-
-        :return: None
         """
+        # Get the number of messages to read
         try:
             num_to_read = int(self.mainframe.view_messages.num_read_entry.text())
         except ValueError:
-            QMessageBox.critical(self.window, 'Error', "Please enter a valid number of messages to read")
+            QMessageBox.critical(self.window, "Error", "Please enter a number of messages to read.")
             return
 
-        ids = [message.id for message in self.messages if not message.read]
-
-        num_to_read = min(num_to_read, len(ids))
-
+        # Get the message IDs and take a minimum
+        message_ids = [message["id"] for message in self.messages if not message["read"]]
+        num_to_read = min(num_to_read, len(message_ids))
         print("Number of messages to read:", num_to_read)
 
+        # Edge case
         if num_to_read == 0:
             QMessageBox.critical(self.window, 'Error', "No messages to read")
             return
 
-        ids = ids[-num_to_read:]
+        # Get the earliest `num_to_read` message IDs
+        message_ids = message_ids[-num_to_read:]
 
-        # make read message request
-        response = self.stub.ReadMessages(ReadMessagesRequest(username=self.username, message_ids=ids))
+        # Send a read messages request
+        response = api.read_messages(message_ids, self.server_addr)
 
-        if response.status == Status.ERROR:
-            QMessageBox.critical(self.window, 'Error', response.error_message)
+        # Check for errors
+        if response["status"] == "ERROR":
+            QMessageBox.critical(self.window, "Error", response["error_message"])
             return
 
     def start_logged_session(self):
@@ -324,11 +319,8 @@ class UserSession:
         the handle_new_messages method and starts the thread. This causes the worker to
         periodically poll the server for new messages and update the messages list in
         the view messages frame with the new messages.
-
-        :return: None
         """
-        self.message_worker = MessageUpdaterWorker(host=self.host,
-                                                   port=self.port,
+        self.message_worker = MessageUpdaterWorker(server_addr=self.server_addr,
                                                    username=self.username)
 
         # Create the thread object
@@ -371,25 +363,29 @@ class UserSession:
 
 class MessageUpdaterWorker(QObject):
     """
-    Worker class to periodically fetch new messages from a separate socket connection.
+    Worker class to periodically fetch new messages for the logged-in user.
     """
-    messages_received = pyqtSignal(list)  # emitted when new messages arrive
+    messages_received = pyqtSignal(list)
 
-    def __init__(self, host: str, port: int, username: str, parent=None):
+    def __init__(self, server_addr: str, username: str, parent=None):
         """
-        :param host: Server's hostname or IP address
-        :param port: Server's port
-        :param username: The current user's name (for message queries, if needed)
+        A class responsible for initializing a network fetcher session to communicate
+        with the server, set up user details, and manage thread execution state.
+
+        :param server_addr: The IP address of the server.
+        :param username: The username of the user to be used for authentication.
+        :param parent: The GUI parent object.
         """
         super().__init__(parent)
 
-        self.host = host
-        self.port = port
+        # IP address of the server
+        self.server_addr = server_addr
+
+        # Username of the logged-in user
         self.username = username
 
-        self.running = False
-        self.channel = None
-        self.stub = None
+        # Status of fetcher thread
+        self.running = threading.Event()
 
     @pyqtSlot()
     def run(self):
@@ -399,21 +395,16 @@ class MessageUpdaterWorker(QObject):
 
         :return: None
         """
-        self.running = True
-
-        self.channel = grpc.insecure_channel(f"{self.host}:{self.port}")
-        self.stub = ChatStub(self.channel)
+        self.running.set()
 
         # 2) Start polling loop
-        while self.running:
+        while self.running.is_set():
             try:
-                response = self.stub.GetMessages(GetMessagesRequest(username=self.username))
-
-                if response.status == Status.ERROR:
-                    print(f"[MessageUpdaterWorker] Error: {response.error_message}")
+                response = api.get_messages(self.username, self.server_addr)
+                if response["status"] == "ERROR":
+                    print(f"[MessageUpdaterWorker] Error: {response["error_message"]}")
                 else:
-                    self.messages_received.emit(list(response.messages))
-
+                    self.messages_received.emit(response["messages"])
             except Exception as e:
                 print(f"[MessageUpdaterWorker] Error: {e}")
                 # On any critical error, you might want to break or handle differently
@@ -422,17 +413,14 @@ class MessageUpdaterWorker(QObject):
             # Sleep for the update interval (in seconds)
             time.sleep(GUI_REFRESH_RATE)
 
-        # Cleanup
-        if self.channel:
-            self.channel.close()
-            self.stub = None
+        # Shutdown
         print("[MessageUpdaterWorker] Worker thread stopped.")
 
     def stop(self):
         """
         Signal the worker loop to stop running.
         """
-        self.running = False
+        self.running.clear()
 
 
 def clear_all_fields(widget: QWidget | QFrame):
@@ -495,20 +483,20 @@ def post_app_exit_tasks(user_session):
 def main():
     parser = argparse.ArgumentParser(allow_abbrev=False, description="GUI for the Message App Design Exercise")
     parser.add_argument("host", type=str, metavar='host', help="The host on which the server is running")
-    parser.add_argument("port", type=int, metavar='port', help="The port at which the server is listening")
     args = parser.parse_args()
 
-    # load GUI
+    # Load GUI
     app = QApplication(argv)
 
+    # Create mainframe and window
     mainframe = MainFrame()
     window = create_window(mainframe)
-
-    print("Trying to connect to server...")
     mainframe.logged_in.hide()
     mainframe.central.hide()
     mainframe.view_messages.hide()
-    user_session = UserSession(args.host, args.port, mainframe, window)
+
+    # Start the user session
+    user_session = UserSession(mainframe, window, args.host)
 
     # display GUI
     window.show()
