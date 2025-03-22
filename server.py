@@ -344,7 +344,8 @@ class ChatServer(ChatServicer):
                 # Retrieves all commits occurring strictly after `latest_commit_id`
                 request = GetCommitsRequest(server_id=self.server_id,
                                             latest_commit_id=self.get_latest_commit_id())
-                response: GetCommitsResponse = stub.GetCommits(request)
+                response: GetCommitsResponse = stub.GetCommits(request,
+                                                               timeout=3)
 
                 # Parse the new commits
                 new_commits = list(response.commits)
@@ -670,6 +671,8 @@ class ChatServer(ChatServicer):
 
         with sqlite3.connect(self.db_file) as db:
             db.execute("DELETE FROM users WHERE username = ?",
+                       (username,))
+            db.execute("DELETE FROM messages WHERE recipient = ?",
                        (username,))
             db.execute("INSERT INTO commits (request) VALUES (?)",
                        (json.dumps(request),))

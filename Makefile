@@ -1,2 +1,2 @@
 clean:
-	rm -rf *.db
+	rm db/*.db
