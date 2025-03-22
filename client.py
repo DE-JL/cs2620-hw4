@@ -57,15 +57,6 @@ class UserSession:
         self.mainframe.view_messages.read_button.clicked.connect(self.read_messages_event)
         self.mainframe.view_messages.delete_button.clicked.connect(self.delete_messages_event)
 
-    def close(self):
-        """
-        Close the connection to the server.
-
-        If the client is not running in debug mode, this method will close the
-        socket connection to the server. This method should be called when the
-        client is finished interacting with the server.
-        """
-        pass
 
     def authenticate_user(self, request_type: str):
         """
@@ -469,16 +460,6 @@ def hash_string(input_string):
     return hashlib.sha256(input_string.encode()).hexdigest()
 
 
-def post_app_exit_tasks(user_session):
-    """
-    Perform tasks that should be done when the application exits.
-
-    :param user_session: The user session to close.
-    :type user_session: UserSession
-    """
-    print("Closing user session...")
-    user_session.close()
-
 
 def main():
     parser = argparse.ArgumentParser(allow_abbrev=False, description="GUI for the Message App Design Exercise")
@@ -496,12 +477,11 @@ def main():
     mainframe.view_messages.hide()
 
     # Start the user session
-    user_session = UserSession(mainframe, window, args.host)
+    _ = UserSession(mainframe, window, args.host)
 
     # display GUI
     window.show()
 
-    app.aboutToQuit.connect(lambda: post_app_exit_tasks(user_session))
     exit(app.exec())
 
 
