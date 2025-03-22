@@ -8,16 +8,16 @@ with config_path.open() as f:
 
 DEBUG = config["debug"]
 GUI_REFRESH_RATE = config["gui_refresh_rate"]
-LOCALHOST = config["network"]["localhost"]
+ID_TO_ADDR_LOCAL = config["id_to_addr_local"]
+ID_TO_ADDR_PUBLIC = config["id_to_addr_public"]
 NETWORK_INTERFACE = config["network"]["interface"]
 PUBLIC_STATUS = config["network"]["public_status"]
-SERVER_PORTS = config["network"]["server_ports"]
 
 __all__ = [
     "DEBUG",
     "GUI_REFRESH_RATE",
-    "LOCALHOST",
+    "ID_TO_ADDR_LOCAL",
+    "ID_TO_ADDR_PUBLIC",
     "NETWORK_INTERFACE",
     "PUBLIC_STATUS",
-    "SERVER_PORTS",
 ]

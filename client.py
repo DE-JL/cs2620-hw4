@@ -24,20 +24,16 @@ class UserSession:
     user interactions in the application's main GUI.
     """
 
-    def __init__(self, mainframe: MainFrame, window: QMainWindow, server_addr: str):
+    def __init__(self, mainframe: MainFrame, window: QMainWindow):
         """
         Initialize a UserSession instance.
 
         :param mainframe: The main application frame.
         :param window: The main application window.
-        :param server_addr: The server IP address.
         """
         # GUI
         self.mainframe = mainframe
         self.window = window
-
-        # IP address of the server
-        self.server_addr = server_addr
 
         # Username of the logged-in user
         self.username = None
@@ -87,9 +83,9 @@ class UserSession:
 
         # Switch on the request type
         if request_type == "CREATE_USER":
-            response = api.create_user(username, password, self.server_addr)
+            response = api.create_user(username, password)
         elif request_type == "LOGIN":
-            response = api.login(username, password, self.server_addr)
+            response = api.login(username, password)
         else:
             raise ValueError(f"Invalid request type: {request_type}")
 
@@ -156,7 +152,7 @@ class UserSession:
         self.sign_out()
 
         # Send the delete user request
-        response = api.delete_user(user_to_delete, self.server_addr)
+        response = api.delete_user(user_to_delete)
 
         # Check for errors
         if response["status"] == "ERROR":
@@ -180,7 +176,7 @@ class UserSession:
         pattern = self.mainframe.central.list_account.search_entry.text()
 
         # Send the request
-        response = api.list_users(pattern, self.server_addr)
+        response = api.list_users(pattern)
 
         # Check for errors
         if response["status"] == "ERROR":
@@ -215,7 +211,7 @@ class UserSession:
             "body": message_body,
             "timestamp": time.time(),
         }
-        response = api.send_message(message, self.server_addr)
+        response = api.send_message(message)
 
         # Check for errors
         if response["status"] == "ERROR":
@@ -262,7 +258,7 @@ class UserSession:
             message_ids.append(message["id"])
 
         # Send the request
-        response = api.delete_messages(message_ids, self.server_addr)
+        response = api.delete_messages(message_ids)
 
         # Check for errors
         if response["status"] == "ERROR":
@@ -301,7 +297,7 @@ class UserSession:
         message_ids = message_ids[-num_to_read:]
 
         # Send a read messages request
-        response = api.read_messages(message_ids, self.server_addr)
+        response = api.read_messages(message_ids)
 
         # Check for errors
         if response["status"] == "ERROR":
@@ -320,8 +316,7 @@ class UserSession:
         periodically poll the server for new messages and update the messages list in
         the view messages frame with the new messages.
         """
-        self.message_worker = MessageUpdaterWorker(server_addr=self.server_addr,
-                                                   username=self.username)
+        self.message_worker = MessageUpdaterWorker(username=self.username)
 
         # Create the thread object
         self.message_thread = QThread()
@@ -367,19 +362,15 @@ class MessageUpdaterWorker(QObject):
     """
     messages_received = pyqtSignal(list)
 
-    def __init__(self, server_addr: str, username: str, parent=None):
+    def __init__(self, username: str, parent=None):
         """
         A class responsible for initializing a network fetcher session to communicate
         with the server, set up user details, and manage thread execution state.
 
-        :param server_addr: The IP address of the server.
         :param username: The username of the user to be used for authentication.
         :param parent: The GUI parent object.
         """
         super().__init__(parent)
-
-        # IP address of the server
-        self.server_addr = server_addr
 
         # Username of the logged-in user
         self.username = username
@@ -400,7 +391,7 @@ class MessageUpdaterWorker(QObject):
         # 2) Start polling loop
         while self.running.is_set():
             try:
-                response = api.get_messages(self.username, self.server_addr)
+                response = api.get_messages(self.username)
                 if response["status"] == "ERROR":
                     print(f"[MessageUpdaterWorker] Error: {response["error_message"]}")
                 else:
@@ -482,7 +473,6 @@ def post_app_exit_tasks(user_session):
 
 def main():
     parser = argparse.ArgumentParser(allow_abbrev=False, description="GUI for the Message App Design Exercise")
-    parser.add_argument("host", type=str, metavar='host', help="The host on which the server is running")
     args = parser.parse_args()
 
     # Load GUI
@@ -496,7 +486,7 @@ def main():
     mainframe.view_messages.hide()
 
     # Start the user session
-    user_session = UserSession(mainframe, window, args.host)
+    user_session = UserSession(mainframe, window)
 
     # display GUI
     window.show()

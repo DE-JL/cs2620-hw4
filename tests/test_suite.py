@@ -107,7 +107,7 @@ def test_auth(server_manager):
         "status": "ERROR",
         "error_message": "Invalid username or password.",
     }
-    resp = login("jason", "wrongpassword")
+    resp = login("jason", "wrong_password")
     assert resp == exp
 
 

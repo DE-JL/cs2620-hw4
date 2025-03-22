@@ -4,7 +4,11 @@ network:
     interface: en0
     localhost: localhost
     public_status: false
-    server_ports:
-        1: 60001
-        2: 60002
-        3: 60003
+id_to_addr_local:
+    1: "localhost:60001"
+    2: "localhost:60002"
+    3: "localhost:60003"
+id_to_addr_public:
+    1: "10.250.235.10:60001"
+    2: "10.250.235.10:60002"
+    3: "10.250.235.10:60003"
