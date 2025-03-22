@@ -5,6 +5,6 @@ network:
     localhost: localhost
     public_status: false
     server_ports:
-        1: 50001
-        2: 50002
-        3: 50003
+        1: 60001
+        2: 60002
+        3: 60003

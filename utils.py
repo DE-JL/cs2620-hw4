@@ -1,6 +1,6 @@
 import netifaces
 
-from config import LOCALHOST, NETWORK_INTERFACE, SERVER_PORTS
+from config import LOCALHOST, NETWORK_INTERFACE, SERVER_PORTS, PUBLIC_STATUS
 
 
 def get_ipaddr() -> str | None:
@@ -22,12 +22,15 @@ def get_ipaddr() -> str | None:
         return None
 
 
-def get_id_to_addr_map(ipaddr: str = LOCALHOST) -> dict[int, str]:
+def get_id_to_addr_map(ipaddr=None) -> dict[int, str]:
     """
     Generates and returns a mapping of server IDs to their corresponding IP addresses and ports.
 
     :return: A map from server ID to their address.
     """
+    if ipaddr is None:
+        ipaddr = get_ipaddr() if PUBLIC_STATUS else LOCALHOST
+
     id_to_addr: dict[int, str] = {}
 
     for server_id, port in SERVER_PORTS.items():
