@@ -308,31 +308,31 @@ Testing is done with PyTest.
 
 The main test suite tests the following.
 
-- Creating a user
+- Creating a user:
     - Test that username collisions are handled.
-- Logging in
+- Logging in:
     - Test for nonexistent users.
-- Get messages
+- Get messages:
     - Asserting that sent messages are being received.
     - Asserting that messages are returned in chronological order.
     - Test fetching for a nonexistent user.
-- Send Messages
+- Send messages:
     - Test that messages are getting delivered.
     - Test sending to a nonexistent user.
-- List users
+- List users:
     - Test that the glob pattern matching works.
     - Testing for no matches.
     - Testing for some matches.
     - Testing for all matches (*).
-- Reading messages
+- Reading messages:
     - Read a list of messages for a user.
     - Fetch messages for that user.
     - Assert that the `read` attribute should now be set to true.
-- Deleting messages
+- Deleting messages:
     - Delete a set of messages for a user.
     - Fetch messages for that user.
     - Assert messages are gone.
-- Deleting users
+- Deleting users:
     - Delete a user.
     - Assert that the user does not show up in a `list_users(*)` query.
     - Assert that fetching messages for that user now returns null.

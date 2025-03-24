@@ -7,22 +7,48 @@
 
 ## Usage Instructions
 
-This app is built in Python. To run the server and UI Client, do the following:
+This app is built in Python. To run the server and the client, follow the steps below.
 
 1. Install the python packages in a virtual environment:
-    - `python3 -m venv venv`
-    - `source venv/bin/activate`
-    - `pip install -r requirements.txt`
+    ```shell
+    > python3 -m venv venv
+    > source venv/bin/activate
+    > pip install -r requirements.txt
+    ```
 2. Change config settings in `config/config.yaml`
-    - If you would like to run the client UI and the server on separate computers, set `network.public_status` to
+    - If you would like to run the client and the server on different computers, set `network.public_status` to
       `true`.
-    - Ensure the client and the server computers are on the same local network. On startup, the server will print its IP
-      address and port.
-    - To toggle the wire protocol implementation between JSON and custom, set `protocol_type` to `json` or `custom`.
-3. Open a terminal and run the server: `python server.py`
-    - If you'd like to run the client UI and the server on separate computers, note the host name and port name in the
-      console output from running the server application.
-4. Run the client: `python client_ui.py [host] [port]`
+    - Ensure the client and the server computers are on the same local network.
+    - The IP addresses and ports of the servers must be specified in the configuration file.
+        - See `id_to_addr_local` and `id_to_addr_public`.
+        - Set the IP address and port of each server to the corresponding server ID.
+    - For example, if you want server 1 to run on `10.0.0.1:50000`, set `ip_to_addr_local.1` to `"10.0.0.1:50000"`.
+    - If you are running the client and server locally,
+3. Open a terminal and run the server with: `python server.py --id $ID`
+    - `ID` is the ID of the server you wish to start.
+4. Run the client: `python client.py`.
+
+### Replication
+
+To run a replicated server, you can start three servers.
+Suppose that you wish to replicate on two machines with IP addresses `10.0.0.1` and `10.0.0.2`, respectively.
+
+A configuration that replicates servers 1 and 2 on machine 1 and server 3 on machine 2 can be specified as follows.
+
+```yaml
+id_to_addr_public:
+    1: "10.0.0.1:60001"
+    2: "10.0.0.1:60002"
+    3: "10.0.0.2:60003"
+```
+
+Then, on machine 1, run `python server.py --id 1` and `python server.py --id 2` in two separate terminals.
+On machine 2, run `python server.py --id 3`.
+
+### Clearing the State
+
+Clearing the state of the application can be toggled on startup: running `python server.py --id 1 --reset` will start
+the first server but clear its database file.
 
 ## RPC
 
@@ -54,49 +80,29 @@ Our chat service defines the interface available to the client.
 
 ```protobuf
 service Chat {
-    rpc Echo(EchoRequest) returns (EchoResponse) {}
+    // Called by the new leader to announce itself as coordinator
+    rpc Coordinator(CoordinatorRequest) returns (Ack);
 
-    rpc Authenticate(AuthRequest) returns (AuthResponse) {}
+    // Called when a server starts an election
+    rpc Election(ElectionRequest) returns (Ack);
 
-    rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse) {}
+    // Executes a query
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 
-    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse) {}
+    // Gets all commits after a specified commit ID
+    rpc GetCommits(GetCommitsRequest) returns (GetCommitsResponse);
 
-    rpc SendMessage(SendMessageRequest) returns (SendMessageResponse) {}
-
-    rpc ReadMessages(ReadMessagesRequest) returns (ReadMessagesResponse) {}
-
-    rpc DeleteMessages(DeleteMessagesRequest) returns (DeleteMessagesResponse) {}
-
-    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse) {}
+    // Called periodically to check if a server is alive
+    rpc Heartbeat(HeartbeatRequest) returns (Ack);
 }
 ```
 
-This interface did not change much at all compared to the first design exercise: this is because we organized our server
-implementation in a similar fashion—it was easy to translate our interface to gRPC style.
+This interface significantly changes from design exercise 2.
+The service now primarily interfaces with the servers, not the client.
+Specifically, we did not want to mix application endpoints (for implementing the chat server) with endpoints that
+implement backend details like leader election, commit log synchronization.
 
-### Data Classes
-
-The non-trivial type sent between the client and the server is the Message type. This holds all the data required to
-represent one unique message sent between users.
-
-```protobuf
-message Message {
-    bytes id = 1;
-    string sender = 2;
-    string recipient = 3;
-    string body = 4;
-    double timestamp = 5;
-    bool read = 6;
-}
-```
-
-Note that because protobuf does not have a native UUID type, we are using `bytes` objects to hold the raw bytes for a
-UUID. To retrieve the actual UUID for hashing, we can convert from bytes to UUID with `uuid.UUID(bytes=bytes)` and UUID
-to bytes with `uuid.bytes`.
-
-All the other request types and response types not containing the `Message` type can be represented with protobuf native
-types (most are strings).
+All client requests are routed to the `Execute()` endpoint. The request will be given in the form of a JSON-string.
 
 ## Project Structure
 
@@ -122,72 +128,111 @@ a message or deletes a message, the client sends `read` and `delete` requests to
 server updates the state, the frontend `MessageUpdaterWorker` will update the messages state on the client and emit a
 signal that tells the UI to update the view messages screen.
 
-### Updates with Design Exercise 2
-
-When switching from our custom protocol to gRPC, we needed to refactor the frontend code to make requests to the gRPC
-channel using the parser host and post arguments with the stub. These changes were pretty straightforward to make as our
-requests and models remain unchanged.
-
 ## Backend Approach
 
-The backend of our app is implemented in the `server.py` file. The server spins up one socket to handle requests from
-multiple clients using the selector approach discussed in class. The user and message data persists in memory currently.
-When the user wants to spin up a client on a public computer (the `public_status` flag is set to `true`), the server
-will provide descriptive output of the host and port to connect to for the client. All request handlers were implemented
-in `server.py`.
+The backend of our app is implemented in the `server.py` file.
+We used **SQLite** for our persistent storage solution and to facilitate replication.
 
-### Execution
+### Query Execution
 
-Since we are not persisting chat information to disk, all information regarding users and messages is stored in memory
-by the server.
+As we'll see, all state manipulations required of this chat application can be implemented with database operations.
 
-```py
-class ChatServer(ChatServicer):
-    """Main server class that manages users and message state for all clients."""
+### Persistent Storage
 
-    def __init__(self):
-        # Initialize storage for users and messages
-        self.users: dict[str, User] = {}
-        self.messages: dict[uuid.UUID, Message] = {}
-        self.inbound_volume: int = 0
-        self.outbound_volume: int = 0
+For application data, all we really need are two tables: one for messages and one for users.
+Every operation can be correctly implemented with these two tables.
+
+- Getting all messages for a user
+    - This can be done with a SQLite query.
+    - Select all messages where the recipient matches the username.
+    - This is a read operation and does not need a commit.
+- Listing all users that match a glob pattern
+    - SQLite select query with `GLOB`.
+    - Read operation -- does not need a commit.
+- Sending a message
+    - Insert the new message into the table.
+    - This operation is a database write (which changes state) and needs a commit.
+- Reading a set of messages
+    - Update all messages (set `read = 1`) where the ID is in a list of message IDs.
+    - Write operation -- needs a commit.
+- Deleting a set of messages
+    - Delete all messages where the ID is in a list of message IDs.
+    - Write operation -- needs a commit.
+- Deleting a user
+    - Delete the user from the users table.
+    - Delete all messages where the recipient is the user.
+    - Write operation -- needs a commit.
+
+#### Messages Table
+
+```sqlite
+CREATE TABLE IF NOT EXISTS messages
+(
+    id        TEXT PRIMARY KEY,
+    sender    TEXT    NOT NULL,
+    recipient TEXT    NOT NULL,
+    body      TEXT    NOT NULL,
+    timestamp REAL    NOT NULL,
+    read      BOOLEAN NOT NULL DEFAULT 0
+);
 ```
 
-The `ChatServer` class inherits from `ChatServicer`, which is defined in the generated `protos/chat_pb2_grpc.py` file.
+The primary key `id` for messages is generated with Python's `uuid.uuid4()` and converted to a raw string.
 
-Users are identified by their unique alphanumeric username.
-Messages are identified by a 16-byte UUID that is assigned on the _client_ side.
-These two dictionaries comprise all the data stored by our server at any given time.
+#### Users Table
 
-#### Request Handling
+```sqlite
+CREATE TABLE IF NOT EXISTS users
+(
+    username TEXT PRIMARY KEY,
+    password TEXT NOT NULL
+)
+```
 
-For request handling, we override the methods implemented by the default CherServicer class to update the users,
-messages state accordingly and return the corresponding response objects.
+The password is hashed on the client-side with Python's `hashlib.sha256()` and stored in the database.
 
-#### Sending Messages
+### Sending Messages
 
 Our implementation does not allow a user to view the history of the messages they have sent.
 This was a decision that was made because the assignment specifications and discussions with the course staff have made
 it clear that only the user who _receives_ a message can delete it. To simplify our implementation, we have made it so
 that once a message is sent, the sender no longer has any association with the message.
 
-#### Deleting a User
+### Deleting a User
 
 As for the project specifications, we must specify what happens to unread messages on a **delete user request.**
 Our implementation will delete all the user's received messages regardless of whether they are unread or not.
 
 ## Testing
 
-Integration tests are provided. This file builds on the integration test from the previous assignment. This time, we
-didn’t have to stress test our own wire protocol.
+All test cases are provided in one test suite.
+This file builds on the integration test from the previous assignment.
 
 To run the tests:
 
 1. Open a terminal and activate the virtual environment: `source venv/bin/activate`.
-2. Run the tests: `python -m pytest tests/`.
+2. Run the tests: `pytest tests`.
 
-### Integration Tests
+#### Main Test Suite
 
-Integration tests were done in `tests/test_integration.py`.
-In these test results, a client-server connection was established, and requests were sent over to the server over the
-network instead of calling the request handlers manually.
+The main test suite is described in `notebook.md`.
+Essentially, it tests all the API endpoints (the core functionality of the chat application) are functional.
+It also tests common edge cases.
+
+#### Testing Persistence
+
+The idea is to reuse our main test suite but stagger the test cases.
+This means we should shut the servers down and restart the servers in between test cases.
+The only way the test cases still pass is if the state is being persisted.
+
+#### Testing Fault Tolerance
+
+The idea is simple:
+
+- Send a request.
+- Stop some of the servers.
+- Send more requests.
+- Restart/stop some more servers.
+
+Ideally, the requests should depend on each other to truly test fault tolerance.
+We used a PyTest fixture to facilitate testing fault tolerance.
